@@ -8,6 +8,7 @@ class AgentState(TypedDict):
     base_branch: str      # e.g. "main"
     issue_details: str
     code_snippet: str
+    test_code: str        # LLM-generated pytest file
     test_results: str
     retry_count: int
     max_retries: int
@@ -19,6 +20,5 @@ def route_after_test(state: AgentState) -> Literal["create_pr", "code_solution",
     if state["status"] == "success":
         return "create_pr"
     if state["retry_count"] < state["max_retries"]:
-        print(f"Test failed. Retrying... ({state['retry_count']}/{state['max_retries']})")
         return "code_solution"
     return "handle_failure"

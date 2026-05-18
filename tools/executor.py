@@ -1,42 +1,57 @@
+import logging
 import subprocess
-import sys
+import tempfile
+from pathlib import Path
 
-def execute_python_tests(code_string: str) -> dict:
-    """Writes code to a temporary file and runs a test assertion via subprocess."""
-    print("-> [System Call] Executing code in an isolated subprocess...")
-    
-    # Create a complete test script combining the code and a unit test assertion
-    test_script = f"""
-{code_string}
+log = logging.getLogger(__name__)
 
-# Simple test harness
-try:
-    assert is_palindrome("racecar") == True, "Failed racecar test"
-    assert is_palindrome("hello") == False, "Failed hello test"
-    print("ALL TESTS PASSED")
-except AssertionError as e:
-    print(f"TEST FAILED: {{e}}")
-    exit(1)
-except Exception as e:
-    print(f"RUNTIME ERROR: {{e}}")
-    exit(2)
-"""
-    
-    try:
-        # Run code string securely outside the main agent process
-        result = subprocess.run(
-            [sys.executable, "-c", test_script],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        
-        if result.returncode == 0:
-            return {"success": True, "output": result.stdout.strip()}
-        else:
-            # Captures both stderr and stdout from the failed runtime
-            error_msg = result.stderr.strip() or result.stdout.strip()
-            return {"success": False, "output": error_msg}
-            
-    except subprocess.TimeoutExpired:
-        return {"success": False, "output": "Execution timed out after 5 seconds."}
+DOCKER_IMAGE = "story-pr-runner"
+
+
+def execute_python_tests(solution_code: str, test_code: str) -> dict:
+    """
+    Writes solution + test files to a temp dir and runs pytest inside a
+    Docker container with no network access and capped resources.
+
+    Build the runner image once with:
+        docker build -t story-pr-runner -f Dockerfile.runner .
+    """
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmppath = Path(tmpdir)
+        (tmppath / "solution.py").write_text(solution_code)
+        (tmppath / "test_solution.py").write_text(test_code)
+
+        log.info("Running tests inside Docker container (image=%s)...", DOCKER_IMAGE)
+        try:
+            result = subprocess.run(
+                [
+                    "docker", "run", "--rm",
+                    "--network", "none",
+                    "--memory", "128m",
+                    "--cpus", "0.5",
+                    "-v", f"{tmpdir}:/code",
+                    DOCKER_IMAGE,
+                    "pytest", "test_solution.py", "-v", "--tb=short",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+
+            if result.returncode == 0:
+                log.info("Tests passed.")
+                return {"success": True, "output": result.stdout.strip()}
+            else:
+                output = result.stderr.strip() or result.stdout.strip()
+                log.warning("Tests failed:\n%s", output)
+                return {"success": False, "output": output}
+
+        except subprocess.TimeoutExpired:
+            log.error("Test execution timed out after 60 seconds.")
+            return {"success": False, "output": "Execution timed out after 60 seconds."}
+        except FileNotFoundError:
+            raise RuntimeError(
+                "Docker is not installed or not on PATH. "
+                "Install Docker and build the runner image:\n"
+                "  docker build -t story-pr-runner -f Dockerfile.runner ."
+            )

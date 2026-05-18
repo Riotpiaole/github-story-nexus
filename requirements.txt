@@ -1,3 +1,9 @@
 langgraph
 langchain-anthropic
+langchain-core
 PyGithub
+pydantic-settings
+tenacity
+fastapi
+uvicorn[standard]
+python-dotenv

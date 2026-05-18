@@ -1,33 +1,59 @@
-import os
-from github import Github, GithubException
+import logging
+from pathlib import Path
+
+from github import Github, GithubIntegration, GithubException
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
+
+from config import get_settings
+
+log = logging.getLogger(__name__)
 
 
 def _get_client() -> Github:
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise EnvironmentError("GITHUB_TOKEN environment variable is not set.")
-    return Github(token)
+    s = get_settings()
+    if s.github_app_id and s.github_private_key_path:
+        log.info("Authenticating via GitHub App (app_id=%s)", s.github_app_id)
+        private_key = Path(s.github_private_key_path).read_text()
+        integration = GithubIntegration(int(s.github_app_id), private_key)
+        token = integration.get_access_token(s.github_installation_id).token
+        return Github(token)
+
+    if s.github_token:
+        log.info("Authenticating via Personal Access Token.")
+        return Github(s.github_token)
+
+    raise EnvironmentError(
+        "No GitHub credentials found. Set GITHUB_TOKEN (PAT) or "
+        "GITHUB_APP_ID + GITHUB_PRIVATE_KEY_PATH + GITHUB_INSTALLATION_ID."
+    )
 
 
+_transient = retry_if_exception_type(GithubException)
+_backoff = wait_exponential(multiplier=1, min=2, max=30)
+
+
+@retry(retry=_transient, stop=stop_after_attempt(3), wait=_backoff, reraise=True)
 def fetch_issue_from_github(repo_name: str, issue_number: int) -> dict:
-    print(f"-> [GitHub API] Fetching issue #{issue_number} from {repo_name}...")
+    log.info("Fetching issue #%d from %s...", issue_number, repo_name)
     g = _get_client()
     repo = g.get_repo(repo_name)
     issue = repo.get_issue(number=issue_number)
-    return {
-        "title": issue.title,
-        "body": issue.body or "",
-    }
+    return {"title": issue.title, "body": issue.body or ""}
 
 
+@retry(retry=_transient, stop=stop_after_attempt(3), wait=_backoff, reraise=True)
 def open_pull_request(repo_name: str, branch_name: str, base_branch: str, title: str, body: str) -> str:
-    print(f"-> [GitHub API] Opening PR from '{branch_name}' into '{base_branch}' on {repo_name}...")
+    log.info("Opening PR from '%s' into '%s' on %s...", branch_name, base_branch, repo_name)
     g = _get_client()
     repo = g.get_repo(repo_name)
-    pr = repo.create_pull(
-        title=title,
-        body=body,
-        head=branch_name,
-        base=base_branch,
-    )
+
+    # Idempotent: return existing PR if one is already open for this branch
+    open_prs = repo.get_pulls(state="open", head=f"{repo_name.split('/')[0]}:{branch_name}")
+    if open_prs.totalCount > 0:
+        existing = open_prs[0]
+        log.info("PR already exists: %s", existing.html_url)
+        return existing.html_url
+
+    pr = repo.create_pull(title=title, body=body, head=branch_name, base=base_branch)
+    log.info("PR created: %s", pr.html_url)
     return pr.html_url

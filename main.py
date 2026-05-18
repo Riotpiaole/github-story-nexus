@@ -1,14 +1,22 @@
 import argparse
+import logging
 import sys
+
+from config import configure_logging, settings
 from graph import build_graph
 
+configure_logging()
+log = logging.getLogger(__name__)
 
-def main():
-    parser = argparse.ArgumentParser(description="Turn a GitHub issue into a Pull Request using Claude.")
-    parser.add_argument("--repo", required=True, help="GitHub repo in owner/repo format (e.g. octocat/hello-world)")
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Turn a GitHub issue into a Pull Request using Claude."
+    )
+    parser.add_argument("--repo", required=True, help="owner/repo (e.g. octocat/hello-world)")
     parser.add_argument("--issue", required=True, type=int, help="Issue number to resolve")
     parser.add_argument("--path", required=True, help="Path to your local clone of the repo")
-    parser.add_argument("--base", default="main", help="Base branch to open the PR against (default: main)")
+    parser.add_argument("--base", default=settings.base_branch, help="Base branch (default from config)")
     args = parser.parse_args()
 
     app = build_graph()
@@ -19,21 +27,22 @@ def main():
         "base_branch": args.base,
         "issue_details": "",
         "code_snippet": "",
+        "test_code": "",
         "test_results": "",
         "retry_count": 0,
-        "max_retries": 3,
+        "max_retries": settings.max_retries,
         "status": "",
         "pr_url": "",
     }
 
-    print(f"\nStarting agent for {args.repo} issue #{args.issue}...\n")
+    log.info("Starting agent for %s issue #%d...", args.repo, args.issue)
     final_state = app.invoke(initial_state)
 
-    print("\n--- DONE ---")
     if final_state["status"] == "pr_created":
-        print(f"PR created: {final_state['pr_url']}")
+        log.info("Done. PR: %s", final_state["pr_url"])
+        print(final_state["pr_url"])
     else:
-        print("Agent failed to produce a passing solution after max retries.")
+        log.error("Agent failed to produce a passing solution.")
         sys.exit(1)
 
 
