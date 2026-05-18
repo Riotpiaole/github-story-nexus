@@ -34,6 +34,10 @@ _TEST_PROMPT = ChatPromptTemplate.from_messages([
 
 
 def code_solution(state: AgentState) -> dict:
+    """Generates Python solution code using Claude.
+
+    Takes the GitHub issue and any prior test failures, returns executable Python code.
+    """
     log.info("Generating solution with Claude (attempt %d/%d)...", state["retry_count"] + 1, settings.max_retries)
     chain = _CODE_PROMPT | llm
     feedback = state.get("test_results") or "None — this is the first attempt."
@@ -45,6 +49,10 @@ def code_solution(state: AgentState) -> dict:
 
 
 def generate_tests(state: AgentState) -> dict:
+    """Generates pytest test file using Claude.
+
+    Takes the issue description and generated solution code, returns pytest test code.
+    """
     log.info("Generating pytest tests with Claude...")
     chain = _TEST_PROMPT | llm
     response = chain.invoke({
@@ -55,6 +63,10 @@ def generate_tests(state: AgentState) -> dict:
 
 
 def test_code(state: AgentState) -> dict:
+    """Executes solution and test code in isolated Docker container.
+
+    Returns 'success' if tests pass, 'retry' if tests fail and retries remain.
+    """
     log.info("Running tests in Docker sandbox...")
     test_run = execute_python_tests(state["code_snippet"], state["test_code"])
     if test_run["success"]:

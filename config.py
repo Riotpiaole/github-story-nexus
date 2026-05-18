@@ -33,10 +33,12 @@ class Settings(BaseSettings):
 
 @lru_cache
 def get_settings() -> Settings:
+    """Loads and caches settings from .env file using Pydantic."""
     return Settings()
 
 
 def _configure_langsmith(s: Settings) -> None:
+    """Enables LangSmith tracing if configured in settings."""
     if s.langchain_tracing_v2:
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_API_KEY"] = s.langchain_api_key
@@ -44,6 +46,7 @@ def _configure_langsmith(s: Settings) -> None:
 
 
 def configure_logging() -> None:
+    """Sets up basic logging with ISO-format timestamps."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",

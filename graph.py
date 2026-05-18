@@ -6,8 +6,17 @@ from actions.llm_nodes import code_solution, generate_tests, test_code
 
 
 def build_graph():
-    workflow = StateGraph(AgentState)
+    """Builds and compiles the LangGraph state machine.
 
+    Workflow: read_issue → code → generate_tests → test → (conditional routing)
+    - On test success: create_pr → END
+    - On test failure with retries left: loop back to code
+    - On max retries exceeded: handle_failure → END
+
+    Returns compiled workflow executable.
+    """
+    
+    workflow = StateGraph(AgentState)
     workflow.add_node("read_issue", read_github_issue)
     workflow.add_node("code", code_solution)
     workflow.add_node("generate_tests", generate_tests)

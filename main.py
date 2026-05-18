@@ -10,6 +10,11 @@ log = logging.getLogger(__name__)
 
 
 def main() -> None:
+    """CLI entry point: reads args, initializes agent state, and runs the workflow.
+
+    On success, prints PR URL to stdout and exits with code 0.
+    On failure, logs error and exits with code 1.
+    """
     parser = argparse.ArgumentParser(
         description="Turn a GitHub issue into a Pull Request using Claude."
     )

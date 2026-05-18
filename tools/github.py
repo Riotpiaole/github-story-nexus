@@ -10,6 +10,10 @@ log = logging.getLogger(__name__)
 
 
 def _get_client() -> Github:
+    """Authenticates with GitHub using either GitHub App or Personal Access Token.
+
+    Raises EnvironmentError if no credentials are configured.
+    """
     s = get_settings()
     if s.github_app_id and s.github_private_key_path:
         log.info("Authenticating via GitHub App (app_id=%s)", s.github_app_id)
@@ -34,6 +38,15 @@ _backoff = wait_exponential(multiplier=1, min=2, max=30)
 
 @retry(retry=_transient, stop=stop_after_attempt(3), wait=_backoff, reraise=True)
 def fetch_issue_from_github(repo_name: str, issue_number: int) -> dict:
+    """Fetches issue title and body from GitHub with exponential backoff retry.
+
+    Args:
+        repo_name: Repository in 'owner/repo' format.
+        issue_number: GitHub issue number.
+
+    Returns:
+        Dict with 'title' and 'body' keys.
+    """
     log.info("Fetching issue #%d from %s...", issue_number, repo_name)
     g = _get_client()
     repo = g.get_repo(repo_name)
@@ -43,6 +56,20 @@ def fetch_issue_from_github(repo_name: str, issue_number: int) -> dict:
 
 @retry(retry=_transient, stop=stop_after_attempt(3), wait=_backoff, reraise=True)
 def open_pull_request(repo_name: str, branch_name: str, base_branch: str, title: str, body: str) -> str:
+    """Opens a pull request, or returns existing URL if PR already exists for this branch.
+
+    Idempotent: safe to call multiple times.
+
+    Args:
+        repo_name: Repository in 'owner/repo' format.
+        branch_name: Feature branch name.
+        base_branch: Base branch (e.g. 'main').
+        title: PR title.
+        body: PR description.
+
+    Returns:
+        The HTML URL of the pull request.
+    """
     log.info("Opening PR from '%s' into '%s' on %s...", branch_name, base_branch, repo_name)
     g = _get_client()
     repo = g.get_repo(repo_name)

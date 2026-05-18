@@ -17,6 +17,11 @@ class AgentState(TypedDict):
 
 
 def route_after_test(state: AgentState) -> Literal["create_pr", "code_solution", "handle_failure"]:
+    """Routes the workflow after test execution.
+
+    Returns 'create_pr' if tests pass, 'code_solution' to retry if retries remain,
+    or 'handle_failure' if max retries exceeded.
+    """
     if state["status"] == "success":
         return "create_pr"
     if state["retry_count"] < state["max_retries"]:
