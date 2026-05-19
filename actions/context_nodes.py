@@ -6,6 +6,7 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
+from cache import get_cache
 from state import AgentState
 from tools.ast_grep import search_functions
 
@@ -332,8 +333,19 @@ def load_context(state: AgentState) -> dict:
     return {"project_context": compressed}
 
 
+def _make_context_key(user_id: str, repo_name: str) -> str:
+    """Build the context cache key.
+
+    Current scheme: user_id + repo_name.
+    Extend here when finer-grained invalidation is needed
+    (e.g. append commit SHA for per-commit caching).
+    """
+    safe_repo = repo_name.replace("/", "_")
+    return f"ctx:{user_id}:{safe_repo}"
+
+
 def load_project_context(state: AgentState) -> dict:
-    """LangGraph node: runs repo_evaluation → load_context → load_skills in sequence."""
+    """LangGraph node: runs repo_evaluation → (L1/L2 cache check) → load_context → load_skills."""
     result: dict = {}
 
     result.update(repo_evaluation(state))
@@ -341,7 +353,19 @@ def load_project_context(state: AgentState) -> dict:
         return result
 
     interim = {**state, **result}
-    result.update(load_context(interim))
+
+    # --- Context cache: Redis L1 (60 s TTL) → PostgreSQL L2 (persistent) ---
+    cache_key = _make_context_key(state["user_id"], state["repo_name"])
+    cache = get_cache()
+
+    cached = cache.get(cache_key)
+    if cached is not None:
+        log.info("Context cache hit repo=%s key=%s", state["repo_name"], cache_key)
+        result["project_context"] = cached
+    else:
+        result.update(load_context(interim))
+        cache.set(cache_key, result["project_context"])
+        log.info("Context cached repo=%s key=%s", state["repo_name"], cache_key)
 
     interim = {**interim, **result}
     result.update(load_skills(interim))

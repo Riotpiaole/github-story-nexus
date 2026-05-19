@@ -10,6 +10,9 @@ flask
 flask-login
 authlib
 pymongo[srv]
+redis>=5.0.0
+psycopg[binary]>=3.1.0
+psycopg-pool>=3.1.0
 python-dotenv
 # Note: ast-grep must be installed separately via npm:
 # npm install -g @ast-grep/cli

@@ -216,18 +216,25 @@ test_runner: "pytest"
 
 ### 4. Context Caching Strategy
 
-**Design**: Project context (file structure, functions, patterns) is cached per execution.
+**Design**: Project context is cached in two layers keyed by `user_id + repo_name`.
 
 ```
-First execution: Generate → Compress → Cache (Redis) → Inject into prompts
-Second execution: Load (Redis) → Inject into prompts
-(Cache invalidated per execution = always fresh)
+get(key)
+  → Redis L1 (60 s TTL)   hit  → return                    [< 1 ms]
+                           miss ↓
+  → PostgreSQL L2          hit  → backfill Redis → return   [< 10 ms]
+                           miss → compute fresh → write both layers
 ```
 
-**Why**: 
-- **Performance**: Avoid re-analyzing project on retries
-- **Token efficiency**: Compressed context fits in prompt
-- **Flexibility**: Vector DB (PostgreSQL) allows future semantic search
+Cache key scheme: `ctx:{user_id}:{owner_repo}` — scoped per user so different
+users get independent cache entries for the same repo. The key builder lives in
+`_make_context_key()` in `context_nodes.py`; extend it there when finer-grained
+invalidation is needed (e.g. append commit SHA for per-commit caching).
+
+**Why**:
+- **Performance**: Eliminates repeated LLM summarisation on retries and re-runs
+- **Resilience**: Redis eviction or restart degrades to L2, never to a full recompute
+- **Failure isolation**: Any cache error is caught and logged; the agent falls through to a fresh compute rather than crashing
 
 ### 5. Repository Validation
 
@@ -285,6 +292,7 @@ Retry (max 3 times)
 ```python
 class AgentState(TypedDict):
     # Input
+    user_id: str                             # authenticated user ID (cache key)
     repo_name: str                           # "owner/repo"
     issue_number: int                        # GitHub issue number
     local_repo_path: str                     # /path/to/local/clone
@@ -337,9 +345,9 @@ The system supports multiple languages through:
 - **Remaining**: ~198K tokens for flexibility
 
 ### Caching Strategy
-- Redis for fast retrieval (<100ms)
-- PostgreSQL vector DB for future semantic search
-- Context regenerated per execution (stays fresh)
+- **L1 Redis** — sub-millisecond retrieval, 60 s TTL auto-eviction
+- **L2 PostgreSQL** — persistent fallback, backfills L1 on miss
+- Cache keyed by `user_id + repo`; extend key scheme in `_make_context_key()` for finer invalidation
 
 ### Timeouts
 - Test execution: 60 seconds

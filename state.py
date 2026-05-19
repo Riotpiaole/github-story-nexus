@@ -2,6 +2,7 @@ from typing import TypedDict, Literal
 
 
 class AgentState(TypedDict):
+    user_id: str          # authenticated user's ID (used for cache key)
     repo_name: str        # "owner/repo"
     issue_number: int
     local_repo_path: str  # path to local clone of the repo

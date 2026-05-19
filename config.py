@@ -36,6 +36,10 @@ class Settings(BaseSettings):
     langchain_api_key: str = ""
     langchain_project: str = "story-pr-agent"
 
+    # ── Cache infrastructure ────────────────────────────────────────────────────
+    redis_url: str = "redis://localhost:6379"
+    postgres_vec_url: str = "postgresql://postgres:postgres@localhost:5432/vectordb"
+
     # ── MongoDB ────────────────────────────────────────────────────────────────
     mongo_username: str
     mongo_password: SecretStr

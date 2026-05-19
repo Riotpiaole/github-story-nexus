@@ -19,7 +19,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from flask import Flask, jsonify, request
-from flask_login import login_required
+from flask_login import current_user, login_required
 
 from auth import init_auth
 from config import configure_logging, get_settings
@@ -105,6 +105,7 @@ def start_run():
     s = get_settings()
     run_id = str(uuid.uuid4())
     initial_state = {
+        "user_id": current_user.get_id(),
         "repo_name": repo,
         "issue_number": issue,
         "local_repo_path": path,

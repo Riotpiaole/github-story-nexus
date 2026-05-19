@@ -7,7 +7,7 @@ A **generic issue-to-PR generator** that automatically reads GitHub issues, gene
 This tool transforms GitHub issues into complete pull requests through an intelligent, project-aware workflow:
 
 ```
-load_project_context ──(repo mismatch)──────────────────────────────────────────────────────► fail_state
+load_project_context ──(repo mismatch)────────────────────► fail_state
         │
         ▼
    read_issue → code → generate_tests → test ──(pass)──► create_pr
@@ -52,7 +52,6 @@ This enables:
 
 - Python 3.12+
 - Docker (for sandboxed testing)
-- `skills.sh` in repository root (for project detection)
 - GitHub credentials (PAT or App)
 - Redis (for context caching)
 - PostgreSQL with pgvector (optional, for semantic search)
@@ -299,8 +298,8 @@ Generated code is:
 | `MAX_RETRIES` | `3` | Max code generation attempts before giving up |
 | `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use for generation |
 | `BASE_BRANCH` | `main` | Default PR target branch |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
-| `POSTGRES_VEC_URL` | — | PostgreSQL vector DB (optional, for semantic search) |
+| `REDIS_URL` | `redis://localhost:6379` | Redis — L1 context cache (60 s TTL) |
+| `POSTGRES_VEC_URL` | `postgresql://…/vectordb` | PostgreSQL — L2 context cache (persistent fallback) |
 | `LANGCHAIN_TRACING_V2` | `false` | Enable LangSmith tracing |
 | `LANGCHAIN_API_KEY` | — | LangSmith API key |
 | `LANGCHAIN_PROJECT` | `story-pr-agent` | LangSmith project name |
@@ -322,6 +321,11 @@ Generated code is:
 │   ├── git_nodes.py               # Git operations (read issue, create PR)
 │   ├── llm_nodes.py               # LLM code generation with tools
 │   └── context_nodes.py           # Repo validation, skills loading, context gen
+├── cache/
+│   ├── __init__.py                # Public API: get_cache()
+│   ├── _manager.py                # Two-level cache orchestration (L1 → L2)
+│   ├── _redis.py                  # L1: Redis with 60 s TTL
+│   └── _pg.py                     # L2: PostgreSQL persistent fallback
 ├── tools/
 │   ├── executor.py                # Docker test execution
 │   ├── github.py                  # GitHub API integration
