@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import re
@@ -9,6 +10,7 @@ from langchain_core.messages import HumanMessage
 from cache import get_cache
 from state import AgentState
 from tools.ast_grep import search_functions
+from tools.github import fetch_issue_from_github
 
 log = logging.getLogger(__name__)
 
@@ -27,9 +29,14 @@ _ENTRY_POINT_MAX_LINES = 60
 _FILE_TREE_MAX_LINES = 100
 
 _README_SUMMARIZE_PROMPT = (
-    "Summarise the following README in 150 words or fewer. "
-    "Focus on: what the project does, who it is for, and its main features. "
-    "Output plain prose only.\n\n{readme}"
+    "You are a senior software engineer. Given a README and a GitHub issue, "
+    "return ONLY a raw JSON object with exactly two keys — no markdown fences, no extra text:\n\n"
+    '"readMeContent": a summary (150 words or fewer) of what the project does, '
+    "its main features, and how the issue relates to it.\n"
+    '"language": the single ast-grep language identifier best suited for solving the issue '
+    "(one of: python, javascript, typescript, go, rust, java, ruby).\n\n"
+    "## README\n{readme}\n\n"
+    "## GitHub Issue\n{issue_content}"
 )
 
 # Candidate dependency manifests, checked in priority order per language family
@@ -200,8 +207,13 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-def _read_readme(repo_path: Path) -> str:
-    """Read README, warn if over 10 MB, then summarise to 150 words via Claude."""
+def _read_readme(repo_path: Path, issue_content: str) -> dict:
+    """Read README and summarise it together with the issue in one LLM call.
+
+    LLM calls: 1
+    Returns:
+        {"readMeContent": "<summary>", "language": "<ast-grep language id>"}
+    """
     for name in ("README.md", "README.rst", "README.txt", "README"):
         candidate = repo_path / name
         if not candidate.exists():
@@ -221,16 +233,19 @@ def _read_readme(repo_path: Path) -> str:
             continue
 
         try:
-            log.info("Summarising README '%s' (%.1f KB)...", name, size / 1024)
+            log.info("Summarising README '%s' (%.1f KB) with issue context...", name, size / 1024)
             from config import llm
-            prompt = _README_SUMMARIZE_PROMPT.format(readme=raw)
+            prompt = _README_SUMMARIZE_PROMPT.format(readme=raw, issue_content=issue_content)
             response = llm.invoke([HumanMessage(content=prompt)])
-            return response.content.strip()
+            result = json.loads(response.content.strip())
+            if "readMeContent" not in result or "language" not in result:
+                raise ValueError("Missing required keys in LLM response.")
+            return result
         except Exception as e:
             log.warning("LLM failed to summarise README '%s': %s", name, e)
-            return raw[:_README_FALLBACK_CHARS]
+            return {"readMeContent": raw[:_README_FALLBACK_CHARS], "language": "python"}
 
-    return "(no README found)"
+    return {"readMeContent": "(no README found)", "language": "python"}
 
 
 def _read_dependencies(repo_path: Path) -> str:
@@ -270,25 +285,55 @@ def _prune(func_lines: list[str]) -> list[str]:
     return func_lines[-_PRUNE_LIMIT:]
 
 
-def _summarize(raw_context: str, readme: str, dependencies: str, entry_point: str) -> str:
-    """Use Claude to produce a structured 300-word project summary."""
+def _summarize(
+    raw_context: str,
+    readme: str,
+    dependencies: str,
+    entry_point: str,
+    issue_details: str,
+) -> dict:
+    """Use Claude to produce a structured 300-word project summary.
+
+    LLM calls: 1
+    Returns:
+        {"readme": "<structured summary>", "language": "<ast-grep language id>"}
+    """
     from config import llm
     prompt = _SUMMARIZE_PROMPT.format(
         readme=f"## README\n{readme}",
         dependencies=f"## Dependency Manifest\n{dependencies}",
         entry_point=f"## Entry Point\n{entry_point}",
         context=f"## File Structure & Function Index\n{raw_context}",
+        issue_details=f"## GitHub Issue\n{issue_details}",
     )
     response = llm.invoke([HumanMessage(content=prompt)])
-    return response.content.strip()
+    raw = response.content.strip()
+    try:
+        result = json.loads(raw)
+        if "readme" not in result or "language" not in result:
+            raise ValueError("Missing required keys in LLM response.")
+        return result
+    except (json.JSONDecodeError, ValueError) as exc:
+        log.warning("Failed to parse _summarize JSON response (%s) — using raw text.", exc)
+        return {"readme": raw, "language": "python"}
 
 
 def load_context(state: AgentState) -> dict:
-    """Builds and compresses project context via token filtering, pruning, and LLM summarization."""
+    """Builds and compresses project context via token filtering, pruning, and LLM summarization.
+
+    LLM calls: 2 (_read_readme x 1, _summarize x 1)
+    """
     repo_path = Path(state["local_repo_path"])
 
-    # --- Gather README, dependencies, and entry point ---
-    readme = _read_readme(repo_path)
+    # --- Fetch GitHub issue before building context ---
+    log.info("Fetching GitHub issue #%d from %s...", state["issue_number"], state["repo_name"])
+    api_response = fetch_issue_from_github(state["repo_name"], state["issue_number"])
+    issue_content = f"Github Issue: Title: {api_response['title']}\nBody: {api_response['body']}"
+    log.info("Issue fetched: %s", api_response["title"])
+    
+    # --- Gather README (+ language inference), dependencies, and entry point ---
+    readme = _read_readme(repo_path, issue_content)
+    language = readme["language"]
     dependencies = _read_dependencies(repo_path)
     entry_point = _read_entry_point(repo_path)
 
@@ -325,12 +370,14 @@ def load_context(state: AgentState) -> dict:
     if func_lines:
         raw_context += "\n\n## Function Index (latest 10)\n" + "\n".join(func_lines)
 
-    # 3. Summarize — LLM produces structured summary from all four sources
-    compressed = _summarize(raw_context, readme, dependencies, entry_point)
+    # 3. Summarize — LLM produces structured summary + infers language from issue + codebase
+    summarized = _summarize(raw_context, readme["readMeContent"], dependencies, entry_point, issue_content)
+    log.info(
+        "Context compressed: %d chars → %d chars (language=%s)",
+        len(raw_context), len(summarized["readme"]), summarized["language"],
+    )
 
-    log.info("Context compressed: %d chars → %d chars", len(raw_context), len(compressed))
-
-    return {"project_context": compressed}
+    return {"project_context": summarized["readme"]}
 
 
 def _make_context_key(user_id: str, repo_name: str) -> str:
@@ -345,7 +392,10 @@ def _make_context_key(user_id: str, repo_name: str) -> str:
 
 
 def load_project_context(state: AgentState) -> dict:
-    """LangGraph node: runs repo_evaluation → (L1/L2 cache check) → load_context → load_skills."""
+    """LangGraph node: repo_evaluation → fetch issue → (L1/L2 cache check) → load_context → load_skills.
+
+    LLM calls: 2 on cache miss (via load_context), 0 on cache hit
+    """
     result: dict = {}
 
     result.update(repo_evaluation(state))

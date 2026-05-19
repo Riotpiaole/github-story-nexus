@@ -19,11 +19,11 @@ class AgentState(TypedDict):
     pr_url: str
 
 
-def route_after_context(state: AgentState) -> Literal["read_issue", "fail_state"]:
+def route_after_context(state: AgentState) -> Literal["code", "fail_state"]:
     """Routes after load_project_context: skip to fail_state if repo validation failed."""
     if state.get("status") == "repo_mismatch":
         return "fail_state"
-    return "read_issue"
+    return "code"
 
 
 def route_after_test(state: AgentState) -> Literal["create_pr", "code_solution", "handle_failure"]:

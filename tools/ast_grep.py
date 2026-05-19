@@ -8,7 +8,7 @@ log = logging.getLogger(__name__)
 DEFAULT_TIMEOUT = 30
 
 
-def search_functions(pattern: str, repo_path: str, language: str = "python") -> dict:
+def search_functions(pattern: str, repo_path: str, language: str = "golang") -> dict:
     """Search for function definitions matching a pattern using ast-grep.
 
     Args:
