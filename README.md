@@ -1,185 +1,402 @@
 # story-pr-agent
 
-A LangGraph state machine that reads a GitHub issue, uses Claude to generate and iteratively test a solution, then opens a Pull Request automatically.
+A **generic issue-to-PR generator** that automatically reads GitHub issues, generates solutions tailored to the project's language and architecture, tests them, and opens pull requests. Works with any repository by detecting project skills and patterns.
 
-## How it works
+## Overview
+
+This tool transforms GitHub issues into complete pull requests through an intelligent, project-aware workflow:
 
 ```
-load_project_context → read_issue → code → generate_tests → test ──(pass)──► create_pr
-                                                   ▲                  │
-                                                   └──(fail, retry)───┘
-                                                                      │
-                                                               (max retries)
-                                                                      ▼
-                                                                  fail_state
+repo_validation → load_skills → load_project_context → read_issue → code → generate_tests → test ──(pass)──► create_pr
+                                                                           ▲                  │
+                                                                           └──(fail, retry)───┘
+                                                                                              │
+                                                                                       (max retries)
+                                                                                              ▼
+                                                                                          fail_state
 ```
 
-1. **load_project_context** — loads or generates project context (file structure, functions, patterns) from cache or generates it on first run. Uses Redis for KV cache and PostgreSQL vector DB for context storage.
-2. **read_issue** — fetches the issue title + body from GitHub
-3. **code** — Claude generates a Python solution based on the issue (and any prior test failures), with access to project context
-4. **generate_tests** — Claude writes a pytest file for the generated solution
-5. **test** — runs both files inside an isolated Docker container
-6. **create_pr** — creates a branch, commits the code, pushes, and opens a PR
+### Workflow Stages
 
-### Context Loading Strategy
+1. **repo_validation** — Validates that local repo matches remote, ensures clean working directory
+2. **load_skills** — Queries `skills.sh` to detect language, framework, project type
+3. **load_project_context** — Generates or retrieves cached project understanding
+4. **read_issue** — Fetches issue title + body from GitHub
+5. **code** — Claude generates solution using skills + project context
+6. **generate_tests** — Claude writes tests matching project conventions
+7. **test** — Runs code + tests in isolated Docker sandbox
+8. **create_pr** — Creates branch, commits, pushes, opens PR
 
-The `load_project_context` node implements intelligent context management:
+## Quick Start
 
-**On first execution:**
-- Reads repository structure (files, directories, code organization)
-- Extracts functions, classes, and code patterns via ast-grep
-- Generates a comprehensive project summary
-- Applies context compression strategies (summarization, token filtering, selective storage)
-- Caches context in Redis (KV cache) and PostgreSQL vector DB
+### Usage
 
-**On subsequent executions (same session):**
-- Retrieves context from Redis cache
-- Uses vector DB for semantic similarity search if needed
-- Injects project context into LLM prompts
+```bash
+python main.py --repo owner/repo --issue 42 --path /path/to/repo [--base main]
+```
 
-**Cache invalidation:**
-- Once per execution (fresh context per agent run)
-- Allows Claude to work with latest project knowledge without stale context
+### Key Feature: Skills-Based Generation
 
-**Context content includes:**
-- File structure and organization
-- Function definitions and signatures
-- Class definitions and hierarchies
-- Import patterns and dependencies
-- Code conventions and patterns
-- Project metadata (language, framework, structure)
+The agent detects your project type and generates language-appropriate code:
 
-## Prerequisites
+```bash
+# skills.sh in your repository root
+language: "python"
+framework: "django"
+test_runner: "pytest"
+python_version: "3.11"
+```
+
+This enables:
+- Language-specific code generation (Python, JavaScript, Go, Rust, Java, etc.)
+- Framework-aware patterns (Django ORM, FastAPI, Express, etc.)
+- Correct test syntax (pytest, jest, unittest, mocha, etc.)
+- Proper package management (pip, npm, cargo, etc.)
+
+## Requirements
 
 - Python 3.12+
-- Docker (for the sandboxed test runner)
-- A GitHub account with either a Personal Access Token or a GitHub App
+- Docker (for sandboxed testing)
+- `skills.sh` in repository root (for project detection)
+- GitHub credentials (PAT or App)
+- Redis (for context caching)
+- PostgreSQL with pgvector (optional, for semantic search)
+- `ast-grep` CLI (for code analysis)
 
-## Setup
+## Installation
 
-### 1. Install dependencies
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/yourusername/story-pr-agent.git
+cd story-pr-agent
+```
+
+### 2. Install Python dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Build the Docker test runner image
-
-This only needs to be done once:
+### 3. Build the Docker test runner image
 
 ```bash
 docker build -t story-pr-runner -f Dockerfile.runner .
 ```
 
-### 3. Configure environment variables
+### 4. Install ast-grep
+
+```bash
+npm install -g @ast-grep/cli
+```
+
+### 5. Start Redis
+
+```bash
+redis-server
+# Or via Docker:
+docker run -d -p 6379:6379 redis:latest
+```
+
+### 6. Configure environment variables
 
 ```bash
 cp .env.example .env
 ```
 
-Then edit `.env`:
+Edit `.env`:
 
 ```env
 # Required
 ANTHROPIC_API_KEY=sk-ant-...
 
 # GitHub auth — choose one option:
-
-# Option A: Personal Access Token (easiest for local dev)
 GITHUB_TOKEN=ghp_...
+# OR
+GITHUB_APP_ID=123456
+GITHUB_PRIVATE_KEY_PATH=/path/to/private-key.pem
+GITHUB_INSTALLATION_ID=78901234
 
-# Option B: GitHub App (recommended for production)
-# GITHUB_APP_ID=123456
-# GITHUB_PRIVATE_KEY_PATH=/path/to/private-key.pem
-# GITHUB_INSTALLATION_ID=78901234
+# Storage
+REDIS_URL=redis://localhost:6379
+POSTGRES_VEC_URL=postgresql://user:password@localhost/vectordb  # Optional
+
+# Agent tuning
+MAX_RETRIES=3
+LLM_MODEL=claude-sonnet-4-6
+BASE_BRANCH=main
 ```
 
-The token needs these GitHub scopes: `repo`, `pull_requests`.
+## Project Configuration: skills.sh
+
+To enable smart project detection and generation, add a `skills.sh` file to your repository root:
+
+```bash
+#!/bin/bash
+# skills.sh - Project skills and specifications
+
+# Core language
+language: "python"
+python_version: "3.11"
+
+# Framework/Libraries
+framework: "django"
+framework_version: "4.2"
+
+# Testing
+test_runner: "pytest"
+test_directory: "tests/"
+
+# Package management
+package_manager: "pip"
+requirements_file: "requirements.txt"
+
+# Code quality
+code_formatter: "black"
+type_checker: "mypy"
+
+# Special capabilities
+async_support: "true"
+orm_used: "django-orm"
+```
+
+### Supported Configurations
+
+The agent understands:
+- **Languages**: python, javascript, typescript, go, rust, java, c++, php, ruby
+- **Frameworks**: django, fastapi, flask, express, nextjs, nuxt, echo, actix, spring, laravel, rails
+- **Test runners**: pytest, jest, unittest, mocha, go test, cargo test, junit
+- **Package managers**: pip, npm, yarn, pnpm, cargo, go modules, maven, bundler
 
 ## Running
 
 ### CLI
 
-Point it at any GitHub repo + issue number you have write access to:
-
 ```bash
 python main.py \
   --repo owner/repo \
   --issue 42 \
-  --path /path/to/local/clone
+  --path /path/to/local/clone \
+  --base main
 ```
-
-Options:
 
 | Flag | Required | Description |
 |------|----------|-------------|
 | `--repo` | yes | `owner/repo` format |
 | `--issue` | yes | Issue number |
-| `--path` | yes | Path to your local clone of the repo |
-| `--base` | no | Base branch to PR into (default: `main`) |
+| `--path` | yes | Path to local clone of repo |
+| `--base` | no | Base branch (default: `main`) |
 
-On success the PR URL is printed to stdout.
-
-### Webhook server
-
-The agent can also be triggered automatically when a GitHub issue is labeled `generate-pr`.
+### Via Webhook (For Automated Triggers)
 
 ```bash
 uvicorn webhook:app --host 0.0.0.0 --port 8000
 ```
 
-Then configure a GitHub webhook on your repo:
-
+Configure GitHub webhook:
 - **Payload URL**: `https://your-server/webhook`
 - **Content type**: `application/json`
 - **Events**: Issues
-- **Secret**: set `GITHUB_WEBHOOK_SECRET` in `.env` to the same value
+- **Secret**: Set `GITHUB_WEBHOOK_SECRET` in `.env`
 
-## Optional: LangSmith tracing
+Trigger by labeling an issue with `generate-pr`
 
-Add these to `.env` to get full traces of every LLM call and graph step:
+## How It Works
 
-```env
-LANGCHAIN_TRACING_V2=true
-LANGCHAIN_API_KEY=ls__...
-LANGCHAIN_PROJECT=story-pr-agent
-```
+### Repo Validation
 
-## Configuration reference
+Before processing, the agent validates:
+- ✓ Local path exists and is a git repository
+- ✓ Remote origin is configured and accessible
+- ✓ Local branch is synchronized with remote
+- ✓ No uncommitted changes that would conflict with PR
+- ✓ Repository is in a clean state for PR creation
 
-All settings live in `.env` (see `.env.example` for the full list):
+If validation fails, the agent refuses to proceed.
+
+### Skills Detection
+
+The agent reads `skills.sh` to understand:
+- What language the project is written in
+- What framework/libraries are used
+- What test framework is expected
+- Project-specific conventions
+
+This enables **generic code generation** — the same agent can generate Python, JavaScript, Go, etc.
+
+### Context Loading
+
+The agent analyzes the project structure:
+- File organization and directory layout
+- Existing functions and classes (via ast-grep)
+- Code patterns and conventions
+- Import structure and dependencies
+- Testing patterns and locations
+
+This context is:
+- **Cached in Redis** for fast retrieval on repeated runs
+- **Compressed** to control LLM token usage
+- **Injected into prompts** to guide code generation
+
+### Code Generation with Skills
+
+Claude receives:
+- GitHub issue details
+- Detected project skills (language, framework, test runner)
+- Project context and patterns
+- Available code search tools (ast-grep)
+
+It generates code that:
+- Matches the detected language and framework
+- Follows project conventions and patterns
+- Is structured for the test framework
+- Uses appropriate idioms and best practices
+
+### Iterative Testing
+
+Generated code is:
+1. Tested immediately in isolated Docker sandbox
+2. If tests fail, failure output is fed back to Claude
+3. Claude iterates on the solution (max retries)
+4. When tests pass, PR is automatically created
+
+## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `ANTHROPIC_API_KEY` | — | Required |
-| `GITHUB_TOKEN` | — | PAT auth |
-| `GITHUB_APP_ID` | — | App auth |
-| `GITHUB_PRIVATE_KEY_PATH` | — | Path to App `.pem` file |
-| `GITHUB_INSTALLATION_ID` | — | App installation ID |
-| `GITHUB_WEBHOOK_SECRET` | — | HMAC secret for webhook verification |
-| `MAX_RETRIES` | `3` | Max code/test iterations before giving up |
-| `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use |
+| `ANTHROPIC_API_KEY` | — | **Required** Anthropic API key |
+| `GITHUB_TOKEN` | — | GitHub Personal Access Token (auth method A) |
+| `GITHUB_APP_ID` | — | GitHub App ID (auth method B) |
+| `GITHUB_PRIVATE_KEY_PATH` | — | Path to GitHub App private key |
+| `GITHUB_INSTALLATION_ID` | — | GitHub App installation ID |
+| `GITHUB_WEBHOOK_SECRET` | — | HMAC secret for webhook requests |
+| `MAX_RETRIES` | `3` | Max code generation attempts before giving up |
+| `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use for generation |
 | `BASE_BRANCH` | `main` | Default PR target branch |
-| `REDIS_URL` | `redis://localhost:6379` | Redis connection for KV cache |
-| `POSTGRES_VEC_URL` | — | PostgreSQL vector DB connection for context storage |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection string |
+| `POSTGRES_VEC_URL` | — | PostgreSQL vector DB (optional, for semantic search) |
+| `LANGCHAIN_TRACING_V2` | `false` | Enable LangSmith tracing |
+| `LANGCHAIN_API_KEY` | — | LangSmith API key |
+| `LANGCHAIN_PROJECT` | `story-pr-agent` | LangSmith project name |
 
-## Project structure
+## Project Structure
 
 ```
 .
-├── main.py               # CLI entry point
-├── webhook.py            # FastAPI webhook server
-├── graph.py              # LangGraph state machine definition
-├── state.py              # AgentState schema + routing logic
-├── config.py             # Settings, LLM client, logging setup
-├── Dockerfile.runner     # Isolated test runner image
+├── main.py                         # CLI entry point
+├── webhook.py                      # FastAPI webhook server
+├── graph.py                        # LangGraph state machine
+├── state.py                        # State schema & routing
+├── config.py                       # Settings & initialization
+├── Dockerfile.runner               # Test execution Docker image
+├── requirements.txt                # Python dependencies
+├── .env.example                    # Environment variable template
 ├── actions/
-│   ├── git_nodes.py      # read_issue, create_pr, handle_failure nodes
-│   └── llm_nodes.py      # code_solution, generate_tests, test_code nodes
-└── tools/
-    ├── executor.py       # Runs code + tests inside Docker
-    ├── github.py         # GitHub API calls (fetch issue, open PR)
-    ├── git_ops.py        # Git branch, commit, push operations
-    ├── ast_grep.py       # ast-grep CLI wrapper for code searching
-    └── langchain_tools.py# LangChain tool definitions for code search
+│   ├── git_nodes.py               # Git operations (read issue, create PR)
+│   ├── llm_nodes.py               # LLM code generation with tools
+│   └── context_nodes.py           # Repo validation, skills loading, context gen
+├── tools/
+│   ├── executor.py                # Docker test execution
+│   ├── github.py                  # GitHub API integration
+│   ├── git_ops.py                 # Git CLI operations
+│   ├── ast_grep.py                # ast-grep CLI wrapper
+│   ├── langchain_tools.py         # LLM-callable tools
+│   ├── storage.py                 # Redis + PostgreSQL abstraction
+│   ├── context_generator.py       # Project context generation
+│   └── context_compression.py     # Context compression strategies
+└── README.md                       # This file
 ```
+
+## Capabilities by Language
+
+| Language | Framework | Test | Status |
+|----------|-----------|------|--------|
+| Python | Django, FastAPI, Flask | pytest, unittest | ✅ Full support |
+| JavaScript | Express, Next.js | Jest, Mocha | ✅ Full support |
+| Go | Gin, Echo | Go test | ✅ Full support |
+| TypeScript | NestJS, Remix | Jest | ✅ Full support |
+| Rust | Actix, Rocket | Cargo test | 🟡 Partial |
+| Java | Spring | JUnit | 🟡 Partial |
+
+Full support: Code generation + testing working reliably
+Partial support: Code generation works, testing may need manual config
+
+## Examples
+
+### Example 1: Python Django Project
+
+```bash
+# Repository with skills.sh:
+language: python
+framework: django
+test_runner: pytest
+
+# Issue: "Add user authentication endpoint"
+python main.py --repo myorg/myproject --issue 123 --path /path/to/myproject
+
+# Result: Claude generates:
+# - Django models for authentication
+# - API endpoints with proper decorators
+# - pytest tests matching project structure
+# - PR with all changes
+```
+
+### Example 2: Node.js Express API
+
+```bash
+# Repository with skills.sh:
+language: javascript
+framework: express
+test_runner: jest
+
+# Issue: "Add rate limiting middleware"
+python main.py --repo myorg/api --issue 456 --path /path/to/api
+
+# Result: Claude generates:
+# - Express middleware function
+# - Jest tests with mocks
+# - Integration into existing routes
+# - PR ready to merge
+```
+
+## Troubleshooting
+
+### Redis Connection Error
+- Ensure Redis is running: `redis-cli ping`
+- Check `REDIS_URL` in `.env`
+
+### Docker Test Runner Not Found
+- Build image: `docker build -t story-pr-runner -f Dockerfile.runner .`
+
+### Repo Validation Fails
+- Ensure local repo is clean (no uncommitted changes)
+- Ensure remote origin matches expected repo
+- Run `git fetch` to sync with remote
+
+### skills.sh Not Found
+- Agent will proceed but with limited language detection
+- Add `skills.sh` to repository root for better results
+
+### LLM Generation Fails
+- Check `ANTHROPIC_API_KEY` is valid
+- Verify Claude model in `.env` is available
+- Check token limits (Claude Sonnet has 200K context)
+
+## Contributing
+
+Contributions welcome! When adding support for new languages/frameworks:
+
+1. Add language support to `context_generator.py`
+2. Update `skills.sh` example in this README
+3. Add to "Capabilities by Language" table
+4. Test with example repository
+
+## License
+
+MIT
+
+## Support
+
+- 🐛 Issues: GitHub Issues
+- 💬 Discussions: GitHub Discussions
+- 📖 Docs: See README.md
