@@ -38,17 +38,9 @@ load_project_context ──(repo mismatch)────────────�
 python main.py --repo owner/repo --issue 42 --path /path/to/repo [--base main]
 ```
 
-### Key Feature: Skills-Based Generation
+### Key Feature: Dynamic Skills Discovery
 
-The agent detects your project type and generates language-appropriate code:
-
-```bash
-# skills.sh in your repository root
-language: "python"
-framework: "django"
-test_runner: "pytest"
-python_version: "3.11"
-```
+The agent automatically discovers and installs the right skills for your project using the [find-skills](https://www.skills.sh/vercel-labs/skills/find-skills) CLI. After building a compressed summary of the repository (README, dependencies, entry point, file tree), it queries the skills.sh registry to find matching agent skills and installs them — no manual configuration needed.
 
 This enables:
 - Language-specific code generation (Python, JavaScript, Go, Rust, Java, etc.)
@@ -190,6 +182,36 @@ python main.py \
 | `--path` | yes | Path to local clone of repo |
 | `--base` | no | Base branch (default: `main`) |
 
+### Via Flask REST API
+
+```bash
+flask --app app run --host 0.0.0.0 --port 8000
+```
+
+Start a run:
+
+```bash
+curl -X POST http://localhost:8000/run \
+  -H "Content-Type: application/json" \
+  -d '{"repo": "owner/repo", "issue": 42, "path": "/path/to/local/clone"}'
+# → {"run_id": "<uuid>", "status": "running"}
+```
+
+Poll for the result:
+
+```bash
+curl http://localhost:8000/run/<uuid>
+# → {"run_id": "...", "status": "done", "agent_status": "pr_created", "pr_url": "https://..."}
+```
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/run` | `POST` | Start a new agent run; returns `run_id` immediately |
+| `/run/<run_id>` | `GET` | Poll status: `running`, `done`, or `error` |
+| `/health` | `GET` | Liveness check |
+
+Because the workflow involves multiple LLM calls and git operations (30–120 s), the endpoint returns `202 Accepted` with a `run_id` and runs the graph in a background thread.
+
 ### Via Webhook (For Automated Triggers)
 
 ```bash
@@ -218,11 +240,13 @@ If `--repo` does not match the remote origin, the workflow sets `status: repo_mi
 
 ### Skills Detection
 
-The agent reads `skills.sh` to understand:
-- What language the project is written in
-- What framework/libraries are used
-- What test framework is expected
-- Project-specific conventions
+After generating the compressed project context, the agent runs `npx skills find` with the full context text as the search query. Matching skills are then installed automatically via `npx skills add`.
+
+This replaces the earlier static `skills.sh` approach — skills are now **discovered dynamically** from the project's actual content rather than declared manually.
+
+Requirements:
+- Node.js must be installed (`npx` available on `$PATH`)
+- Internet access to reach the skills.sh registry
 
 This enables **generic code generation** — the same agent can generate Python, JavaScript, Go, etc.
 
@@ -286,7 +310,8 @@ Generated code is:
 ```
 .
 ├── main.py                         # CLI entry point
-├── webhook.py                      # FastAPI webhook server
+├── app.py                          # Flask REST API server
+├── webhook.py                      # FastAPI webhook server (GitHub events)
 ├── graph.py                        # LangGraph state machine
 ├── state.py                        # State schema & routing
 ├── config.py                       # Settings & initialization
@@ -374,9 +399,10 @@ python main.py --repo myorg/api --issue 456 --path /path/to/api
 - **`--repo` mismatch**: The `--repo owner/repo` value must match the remote origin of the local clone at `--path`. Check with `git -C /path/to/repo remote get-url origin`.
 - **Uncommitted changes**: Stash or commit all local changes before running (`git stash`).
 
-### skills.sh Not Found
-- Agent will proceed but with limited language detection
-- Add `skills.sh` to repository root for better results
+### No Skills Discovered
+- Ensure `npx` is available: `npx --version`
+- Check internet access — the skills.sh registry must be reachable
+- A warning is logged and the agent continues without skills if none are found
 
 ### LLM Generation Fails
 - Check `ANTHROPIC_API_KEY` is valid

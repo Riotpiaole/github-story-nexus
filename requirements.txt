@@ -6,6 +6,7 @@ pydantic-settings
 tenacity
 fastapi
 uvicorn[standard]
+flask
 python-dotenv
 # Note: ast-grep must be installed separately via npm:
 # npm install -g @ast-grep/cli
