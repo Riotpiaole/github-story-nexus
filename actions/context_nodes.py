@@ -11,6 +11,9 @@ from tools.ast_grep import search_functions
 
 log = logging.getLogger(__name__)
 
+_SYMBOL_STRIP = re.compile(r'[#*`>_\-|\\]')
+_WHITESPACE_COLLAPSE = re.compile(r'\s+')
+
 _SKILLS_PATTERN = re.compile(r'^(\w+):\s*["\']?([^"\'#\n]+?)["\']?\s*$')
 _IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
 _NOISE_TOKENS = re.compile(r'\b(__pycache__|\.pyc|\.DS_Store|Thumbs\.db)\b')
@@ -118,24 +121,67 @@ def repo_evaluation(state: AgentState) -> dict:
 
 
 def load_skills(state: AgentState) -> dict:
-    """Reads and parses skills.sh from the repo root into a dict."""
-    skills_path = Path(state["local_repo_path"]) / "skills.sh"
-    skills: dict = {}
+    """Discovers and installs agent skills via find-skills CLI using the compressed project context."""
+    context = state.get("project_context", "")
+    if not context:
+        log.warning("No project context available — skipping skill discovery.")
+        return {"skills": {}}
 
-    if not skills_path.exists():
-        log.warning("skills.sh not found in %s — proceeding without project skills.", state["local_repo_path"])
-        return {"skills": skills}
+    query = _extract_skillset_query(context)
 
-    for line in _read_text(skills_path).splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or line.startswith("export ") or line == "#!/bin/bash":
-            continue
-        match = _SKILLS_PATTERN.match(line)
-        if match:
-            skills[match.group(1)] = match.group(2).strip()
+    try:
+        search = subprocess.run(
+            ["npx", "--yes", "skills", "find", query],
+            capture_output=True, text=True, timeout=60,
+        )
+    except FileNotFoundError:
+        raise RuntimeError("npx not found — install Node.js to enable skill discovery.")
 
-    log.info("Skills loaded: %s", skills)
+    if search.returncode != 0:
+        log.warning("skills find failed: %s", search.stderr.strip())
+        return {"skills": {}}
+
+    skills = _parse_skills_output(search.stdout)
+
+    if not skills:
+        log.warning("find-skills returned no matching skills for the project context.")
+        return {"skills": {}}
+
+    log.info("Skills discovered: %s", list(skills.keys()))
+
+    for name, source in skills.items():
+        _install_skill(name, source)
+
     return {"skills": skills}
+
+
+def _extract_skillset_query(context: str) -> str:
+    cleaned = _SYMBOL_STRIP.sub(' ', context)
+    return _WHITESPACE_COLLAPSE.sub(' ', cleaned).strip()
+
+
+def _parse_skills_output(output: str) -> dict:
+    """Parse `npx skills find` stdout into {skill_name: source_url}."""
+    skills: dict = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        m = _SKILLS_PATTERN.match(line)
+        if m:
+            skills[m.group(1)] = m.group(2).strip()
+    return skills
+
+
+def _install_skill(name: str, source: str) -> None:
+    result = subprocess.run(
+        ["npx", "--yes", "skills", "add", source, "--skill", name],
+        capture_output=True, text=True, timeout=60,
+    )
+    if result.returncode == 0:
+        log.info("Installed skill '%s' from %s", name, source)
+    else:
+        log.warning("Failed to install skill '%s': %s", name, result.stderr.strip())
 
 
 def _read_text(path: Path) -> str:
@@ -239,7 +285,6 @@ def _summarize(raw_context: str, readme: str, dependencies: str, entry_point: st
 def load_context(state: AgentState) -> dict:
     """Builds and compresses project context via token filtering, pruning, and LLM summarization."""
     repo_path = Path(state["local_repo_path"])
-    language = state.get("skills", {}).get("language", "python")
 
     # --- Gather README, dependencies, and entry point ---
     readme = _read_readme(repo_path)
@@ -283,11 +328,12 @@ def load_context(state: AgentState) -> dict:
     compressed = _summarize(raw_context, readme, dependencies, entry_point)
 
     log.info("Context compressed: %d chars → %d chars", len(raw_context), len(compressed))
+
     return {"project_context": compressed}
 
 
 def load_project_context(state: AgentState) -> dict:
-    """LangGraph node: runs repo_evaluation → load_skills → load_context in sequence."""
+    """LangGraph node: runs repo_evaluation → load_context → load_skills in sequence."""
     result: dict = {}
 
     result.update(repo_evaluation(state))
@@ -295,9 +341,9 @@ def load_project_context(state: AgentState) -> dict:
         return result
 
     interim = {**state, **result}
-    result.update(load_skills(interim))
+    result.update(load_context(interim))
 
     interim = {**interim, **result}
-    result.update(load_context(interim))
+    result.update(load_skills(interim))
 
     return result
