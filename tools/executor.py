@@ -9,9 +9,15 @@ DOCKER_IMAGE = "story-pr-runner"
 
 
 def execute_python_tests(solution_code: str, test_code: str) -> dict:
-    """
-    Writes solution + test files to a temp dir and runs pytest inside a
+    """Writes solution + test files to a temp dir and runs pytest inside a
     Docker container with no network access and capped resources.
+
+    Args:
+        solution_code: Python code to be tested.
+        test_code: Pytest test code.
+
+    Returns:
+        Dict with 'success' bool and 'output' str containing test results.
 
     Build the runner image once with:
         docker build -t story-pr-runner -f Dockerfile.runner .

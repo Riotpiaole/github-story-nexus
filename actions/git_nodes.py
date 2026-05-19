@@ -7,7 +7,14 @@ from tools.git_ops import create_branch_and_commit
 log = logging.getLogger(__name__)
 
 
+def read_repo_source_code(state: AgentState)-> dict:
+    return {}
+
 def read_github_issue(state: AgentState) -> dict:
+    """Fetches issue details from GitHub API.
+
+    Returns formatted issue title and body, initializes retry_count and max_retries.
+    """
     log.info("Fetching GitHub issue #%d from %s...", state["issue_number"], state["repo_name"])
     api_response = fetch_issue_from_github(state["repo_name"], state["issue_number"])
     log.info("Issue fetched: %s", api_response["title"])
@@ -19,6 +26,11 @@ def read_github_issue(state: AgentState) -> dict:
 
 
 def create_pr(state: AgentState) -> dict:
+    """Creates a new branch, commits solution code, and opens a GitHub pull request.
+
+    Branch name format: fix/issue-{issue_number}
+    Returns the opened PR URL.
+    """
     branch_name = f"fix/issue-{state['issue_number']}"
     filename = f"solution_issue_{state['issue_number']}.py"
     log.info("Committing code and creating PR on branch '%s'...", branch_name)
@@ -43,6 +55,10 @@ def create_pr(state: AgentState) -> dict:
 
 
 def handle_failure(state: AgentState) -> dict:
+    """Logs failure details when max retries are exceeded.
+
+    This is the terminal node for failed solution attempts.
+    """
     log.error(
         "Agent failed to produce a passing solution after %d attempts. Last error:\n%s",
         state["retry_count"],

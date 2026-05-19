@@ -8,6 +8,7 @@ log = logging.getLogger(__name__)
 
 
 def _run(cmd: list[str], cwd: str) -> str:
+    """Runs a shell command and returns stdout, raises RuntimeError on failure."""
     result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"git {cmd[1]} failed:\n{result.stderr.strip()}")
@@ -15,10 +16,12 @@ def _run(cmd: list[str], cwd: str) -> str:
 
 
 def _authenticated_remote_url(remote_url: str, token: str) -> str:
+    """Injects GitHub token into HTTPS remote URL for passwordless authentication."""
     return re.sub(r"https://([^@]*@)?", f"https://x-access-token:{token}@", remote_url)
 
 
 def _branch_exists_locally(local_repo_path: str, branch_name: str) -> bool:
+    """Checks if a branch exists in the local repository."""
     result = _run(["git", "branch", "--list", branch_name], cwd=local_repo_path)
     return bool(result.strip())
 
@@ -30,6 +33,18 @@ def create_branch_and_commit(
     code: str,
     filename: str,
 ) -> None:
+    """Creates a branch, writes code to file, commits, and pushes to origin.
+
+    Idempotent: reuses existing branch/commit if no changes are detected.
+    Uses GITHUB_TOKEN from environment for authenticated push.
+
+    Args:
+        local_repo_path: Path to local repository clone.
+        branch_name: Name of feature branch to create.
+        base_branch: Base branch to branch from (e.g. 'main').
+        code: Solution code to write to file.
+        filename: Name of file to create in the repository.
+    """
     token = os.getenv("GITHUB_TOKEN")
     if not token:
         raise EnvironmentError("GITHUB_TOKEN is not set.")

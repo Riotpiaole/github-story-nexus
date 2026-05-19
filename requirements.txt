@@ -7,3 +7,6 @@ tenacity
 fastapi
 uvicorn[standard]
 python-dotenv
+# Note: ast-grep must be installed separately via npm:
+# npm install -g @ast-grep/cli
+pytest

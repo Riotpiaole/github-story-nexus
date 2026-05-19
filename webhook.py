@@ -33,6 +33,11 @@ def _verify_signature(payload: bytes, signature: str | None, secret: str) -> Non
 
 
 async def _run_agent(repo_name: str, issue_number: int) -> None:
+    """Runs the agent asynchronously in a background thread.
+
+    Initializes state with repo and issue details, invokes the graph,
+    and logs the result (success or failure).
+    """
     s = get_settings()
     initial_state = {
         "repo_name": repo_name,
@@ -64,6 +69,14 @@ async def github_webhook(
     x_github_event: str = Header(default=""),
     x_hub_signature_256: str | None = Header(default=None),
 ) -> dict:
+    """GitHub webhook endpoint for issue events.
+
+    Verifies webhook signature (if secret is configured), filters for 'generate-pr' labels,
+    and spawns the agent asynchronously.
+
+    Returns:
+        JSON with status ('accepted', 'ignored') and details.
+    """
     s = get_settings()
     payload_bytes = await request.body()
 
@@ -90,4 +103,5 @@ async def github_webhook(
 
 @app.get("/health")
 async def health() -> dict:
+    """Health check endpoint for monitoring."""
     return {"status": "ok"}
