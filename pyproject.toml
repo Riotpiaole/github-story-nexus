@@ -1,0 +1,18 @@
+[project]
+name = "story-pr-agents"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "fastapi>=0.136.1",
+    "langchain-anthropic>=1.4.3",
+    "langchain-core>=1.4.0",
+    "langgraph>=1.2.0",
+    "pydantic-settings>=2.14.1",
+    "pygithub>=2.9.1",
+    "pytest>=9.0.3",
+    "python-dotenv>=1.2.2",
+    "tenacity>=9.1.4",
+    "uvicorn[standard]>=0.47.0",
+]

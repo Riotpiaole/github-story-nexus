@@ -27,7 +27,7 @@ git -C /Users/rockliang/workplace/simple_calculator remote get-url origin
 From the **repo root**:
 
 ```bash
-pytest actions/context_nodes.test.py -v -s
+uv run pytest actions/context_nodes.test.py -v -s
 ```
 
 `-s` keeps stdout visible so you can see the printed skills and project context summary.
@@ -35,7 +35,7 @@ pytest actions/context_nodes.test.py -v -s
 ### Run as a plain script
 
 ```bash
-python actions/context_nodes.test.py
+uv run python actions/context_nodes.test.py
 ```
 
 ### What the test checks

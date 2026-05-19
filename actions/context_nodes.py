@@ -6,7 +6,6 @@ from pathlib import Path
 
 from langchain_core.messages import HumanMessage
 
-from config import llm
 from state import AgentState
 from tools.ast_grep import search_functions
 
@@ -176,6 +175,7 @@ def _read_readme(repo_path: Path) -> str:
 
         try:
             log.info("Summarising README '%s' (%.1f KB)...", name, size / 1024)
+            from config import llm
             prompt = _README_SUMMARIZE_PROMPT.format(readme=raw)
             response = llm.invoke([HumanMessage(content=prompt)])
             return response.content.strip()
@@ -225,6 +225,7 @@ def _prune(func_lines: list[str]) -> list[str]:
 
 def _summarize(raw_context: str, readme: str, dependencies: str, entry_point: str) -> str:
     """Use Claude to produce a structured 300-word project summary."""
+    from config import llm
     prompt = _SUMMARIZE_PROMPT.format(
         readme=f"## README\n{readme}",
         dependencies=f"## Dependency Manifest\n{dependencies}",

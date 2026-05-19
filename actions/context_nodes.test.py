@@ -12,7 +12,8 @@ Usage:
 import sys
 from pathlib import Path
 
-# Ensure the repo root is on sys.path before any project imports.
+# Must come before any project imports: add repo root to sys.path and load .env
+# so that `state`, `tools`, and `config` (with ANTHROPIC_API_KEY) are all resolvable.
 REPO_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
@@ -20,7 +21,8 @@ from dotenv import load_dotenv
 
 load_dotenv(REPO_ROOT / ".env")
 
-from actions.context_nodes import load_project_context  # noqa: E402 (must come after load_dotenv)
+from context_nodes import load_project_context  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Target repo
@@ -66,12 +68,12 @@ def test_load_project_context_integration():
     assert "project_context" in result, "Expected 'project_context' key in result"
     assert len(result["project_context"]) > 100, "project_context is suspiciously short"
 
-    print("\n--- skills ---")
-    for k, v in result.get("skills", {}).items():
-        print(f"  {k}: {v}")
+    # print("\n--- skills ---")
+    # for k, v in result.get("skills", {}).items():
+    #     print(f"  {k}: {v}")
 
-    print("\n--- project_context (first 500 chars) ---")
-    print(result["project_context"][:500])
+    # print("\n--- project_context (first 500 chars) ---")
+    # print(result["project_context"][:500])
 
 
 if __name__ == "__main__":
