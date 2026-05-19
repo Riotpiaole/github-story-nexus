@@ -30,6 +30,8 @@ def main() -> None:
         "issue_number": args.issue,
         "local_repo_path": args.path,
         "base_branch": args.base,
+        "skills": {},
+        "project_context": "",
         "issue_details": "",
         "code_snippet": "",
         "test_code": "",
@@ -46,6 +48,12 @@ def main() -> None:
     if final_state["status"] == "pr_created":
         log.info("Done. PR: %s", final_state["pr_url"])
         print(final_state["pr_url"])
+    elif final_state["status"] == "repo_mismatch":
+        log.error(
+            "--repo '%s' does not match the remote origin of '%s'. Aborting.",
+            args.repo, args.path,
+        )
+        sys.exit(1)
     else:
         log.error("Agent failed to produce a passing solution.")
         sys.exit(1)

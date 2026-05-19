@@ -7,25 +7,28 @@ A **generic issue-to-PR generator** that automatically reads GitHub issues, gene
 This tool transforms GitHub issues into complete pull requests through an intelligent, project-aware workflow:
 
 ```
-repo_validation → load_skills → load_project_context → read_issue → code → generate_tests → test ──(pass)──► create_pr
-                                                                           ▲                  │
-                                                                           └──(fail, retry)───┘
-                                                                                              │
-                                                                                       (max retries)
-                                                                                              ▼
-                                                                                          fail_state
+load_project_context ──(repo mismatch)──────────────────────────────────────────────────────► fail_state
+        │
+        ▼
+   read_issue → code → generate_tests → test ──(pass)──► create_pr
+                  ▲                      │
+                  └──(fail, retry)───────┘
+                                         │
+                                  (max retries)
+                                         ▼
+                                     fail_state
 ```
+
+`load_project_context` bundles repo validation, skills loading, and context generation. If the `--repo` flag does not match the remote origin, the workflow routes immediately to `fail_state` without proceeding further.
 
 ### Workflow Stages
 
-1. **repo_validation** — Validates that local repo matches remote, ensures clean working directory
-2. **load_skills** — Queries `skills.sh` to detect language, framework, project type
-3. **load_project_context** — Generates or retrieves cached project understanding
-4. **read_issue** — Fetches issue title + body from GitHub
-5. **code** — Claude generates solution using skills + project context
-6. **generate_tests** — Claude writes tests matching project conventions
-7. **test** — Runs code + tests in isolated Docker sandbox
-8. **create_pr** — Creates branch, commits, pushes, opens PR
+1. **load_project_context** — Validates the repo, loads skills, and generates project understanding. Fails immediately with exit code 1 if `--repo` does not match the remote origin.
+2. **read_issue** — Fetches issue title + body from GitHub
+3. **code** — Claude generates solution using skills + project context
+4. **generate_tests** — Claude writes tests matching project conventions
+5. **test** — Runs code + tests in isolated Docker sandbox
+6. **create_pr** — Creates branch, commits, pushes, opens PR
 
 ## Quick Start
 
@@ -208,11 +211,10 @@ Trigger by labeling an issue with `generate-pr`
 Before processing, the agent validates:
 - ✓ Local path exists and is a git repository
 - ✓ Remote origin is configured and accessible
-- ✓ Local branch is synchronized with remote
+- ✓ `--repo` matches the remote origin URL
 - ✓ No uncommitted changes that would conflict with PR
-- ✓ Repository is in a clean state for PR creation
 
-If validation fails, the agent refuses to proceed.
+If `--repo` does not match the remote origin, the workflow sets `status: repo_mismatch` and routes directly to `fail_state` — no skills loading, no context generation, no LLM calls. The CLI exits with code 1 and logs the conflicting repo and path.
 
 ### Skills Detection
 
@@ -369,9 +371,8 @@ python main.py --repo myorg/api --issue 456 --path /path/to/api
 - Build image: `docker build -t story-pr-runner -f Dockerfile.runner .`
 
 ### Repo Validation Fails
-- Ensure local repo is clean (no uncommitted changes)
-- Ensure remote origin matches expected repo
-- Run `git fetch` to sync with remote
+- **`--repo` mismatch**: The `--repo owner/repo` value must match the remote origin of the local clone at `--path`. Check with `git -C /path/to/repo remote get-url origin`.
+- **Uncommitted changes**: Stash or commit all local changes before running (`git stash`).
 
 ### skills.sh Not Found
 - Agent will proceed but with limited language detection
