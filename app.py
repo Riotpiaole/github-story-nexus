@@ -19,7 +19,9 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from flask import Flask, jsonify, request
+from flask_login import login_required
 
+from auth import init_auth
 from config import configure_logging, get_settings
 from graph import build_graph
 
@@ -27,6 +29,7 @@ configure_logging()
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
+init_auth(app)
 _graph = build_graph()
 
 # Bound concurrency to the number of logical CPUs so we never spawn more
@@ -67,6 +70,7 @@ def _execute(run_id: str, initial_state: dict) -> None:
 
 
 @app.post("/run")
+@login_required
 def start_run():
     """Start a new agent run.
 
@@ -127,6 +131,7 @@ def start_run():
 
 
 @app.get("/run/<run_id>")
+@login_required
 def get_run(run_id: str):
     """Poll the status of an agent run.
 

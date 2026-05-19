@@ -7,6 +7,9 @@ tenacity
 fastapi
 uvicorn[standard]
 flask
+flask-login
+authlib
+pymongo[srv]
 python-dotenv
 # Note: ast-grep must be installed separately via npm:
 # npm install -g @ast-grep/cli

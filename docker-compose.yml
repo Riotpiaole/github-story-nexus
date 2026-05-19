@@ -10,10 +10,13 @@ services:
     environment:
       REDIS_URL: redis://redis:6379
       POSTGRES_VEC_URL: postgresql://postgres:postgres@postgres:5432/vectordb
+      MONGODB_URI: mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongo:27017
     depends_on:
       redis:
         condition: service_healthy
       postgres:
+        condition: service_healthy
+      mongo:
         condition: service_healthy
     restart: unless-stopped
 
@@ -25,6 +28,22 @@ services:
       - ${VOLUME_MOUNT_PATH}/redis:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  mongo:
+    image: mongo:7
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
+    volumes:
+      - ${VOLUME_MOUNT_PATH}/mongo:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 5s
       timeout: 3s
       retries: 5

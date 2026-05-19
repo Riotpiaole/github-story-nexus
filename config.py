@@ -3,31 +3,63 @@ import os
 from functools import lru_cache
 from pathlib import Path
 
+from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
+from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tools.langchain_tools import get_code_search_tools
 
+# Explicitly load .env into os.environ before Settings is instantiated.
+# pydantic-settings also reads env_file directly, but calling load_dotenv()
+# here ensures os.getenv() calls anywhere else in the process see the same values.
+load_dotenv()
+
 
 class Settings(BaseSettings):
-    # Anthropic
+    # ── Anthropic ──────────────────────────────────────────────────────────────
     anthropic_api_key: str
 
-    # GitHub — PAT or App (at least one must be set)
-    github_token: str = ""
-    github_app_id: str = ""
-    github_private_key_path: str = ""
-    github_installation_id: int = 0
-    github_webhook_secret: str = ""
+    # ── GitHub — PAT or App (at least one must be set) ─────────────────────────
+    github_token: str
+    github_app_id: str
+    github_private_key_path: str
+    github_installation_id: int
+    github_webhook_secret: str
 
-    # Agent tuning
+    # ── Agent tuning ───────────────────────────────────────────────────────────
     max_retries: int = 3
     llm_model: str = "claude-sonnet-4-6"
     base_branch: str = "main"
 
-    # LangSmith
+    # ── LangSmith tracing (optional) ───────────────────────────────────────────
     langchain_tracing_v2: bool = False
     langchain_api_key: str = ""
     langchain_project: str = "story-pr-agent"
+
+    # ── MongoDB ────────────────────────────────────────────────────────────────
+    mongo_username: str
+    mongo_password: SecretStr
+    mongodb_uri: SecretStr
+
+    # ── Flask ──────────────────────────────────────────────────────────────────
+    flask_secret_key: SecretStr
+
+    # ── GitHub OAuth ───────────────────────────────────────────────────────────
+    github_oauth_client_id: str
+    github_oauth_client_secret: SecretStr
+
+    # ── Google OAuth ───────────────────────────────────────────────────────────
+    google_oauth_client_id: str
+    google_oauth_client_secret: SecretStr
+
+    # ── Meta OAuth ─────────────────────────────────────────────────────────────
+    meta_oauth_client_id: str
+    meta_oauth_client_secret: SecretStr
+
+    # ── Microsoft OAuth ────────────────────────────────────────────────────────
+    microsoft_oauth_client_id: str
+    microsoft_oauth_client_secret: SecretStr
+    microsoft_tenant_id: str = "common"
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
