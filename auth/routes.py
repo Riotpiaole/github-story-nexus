@@ -37,10 +37,6 @@ def _fetch_and_normalize(provider: str, token: dict) -> dict:
             return _normalize_github(token)
         elif provider == "google":
             return _normalize_google(token)
-        elif provider == "meta":
-            return _normalize_meta(token)
-        elif provider == "microsoft":
-            return _normalize_microsoft(token)
     except (KeyError, TypeError) as exc:
         raise RuntimeError(f"Unexpected response shape from {provider}: {exc}") from exc
 
@@ -71,31 +67,6 @@ def _normalize_google(token: dict) -> dict:
         "username": info.get("name", ""),
         "email": info.get("email", ""),
         "avatar_url": info.get("picture", ""),
-    }
-
-
-def _normalize_meta(token: dict) -> dict:
-    # Request the fields we need explicitly; Meta Graph API omits them otherwise.
-    resp = oauth.meta.get(
-        "me?fields=id,name,email,picture.type(large)", token=token
-    ).json()
-    return {
-        "provider_id": resp["id"],
-        "username": resp.get("name", ""),
-        "email": resp.get("email", ""),
-        "avatar_url": resp.get("picture", {}).get("data", {}).get("url", ""),
-    }
-
-
-def _normalize_microsoft(token: dict) -> dict:
-    # userinfo() decodes the OIDC ID token claims included in the token response.
-    info = oauth.microsoft.userinfo(token=token)
-    return {
-        # Azure supplies "oid" (object ID) as the stable per-tenant subject.
-        "provider_id": info.get("oid") or info.get("sub", ""),
-        "username": info.get("name", ""),
-        "email": info.get("email") or info.get("preferred_username", ""),
-        "avatar_url": "",  # Microsoft Graph /me/photo requires a separate call
     }
 
 

@@ -56,15 +56,6 @@ class Settings(BaseSettings):
     google_oauth_client_id: str
     google_oauth_client_secret: SecretStr
 
-    # ── Meta OAuth ─────────────────────────────────────────────────────────────
-    meta_oauth_client_id: str
-    meta_oauth_client_secret: SecretStr
-
-    # ── Microsoft OAuth ────────────────────────────────────────────────────────
-    microsoft_oauth_client_id: str
-    microsoft_oauth_client_secret: SecretStr
-    microsoft_tenant_id: str = "common"
-
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
