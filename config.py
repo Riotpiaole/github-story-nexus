@@ -20,11 +20,11 @@ class Settings(BaseSettings):
     anthropic_api_key: str
 
     # ── GitHub — PAT or App (at least one must be set) ─────────────────────────
-    github_token: str
-    github_app_id: str
-    github_private_key_path: str
-    github_installation_id: int
-    github_webhook_secret: str
+    github_token: str = ""
+    github_app_id: str = ""
+    github_private_key_path: str = ""
+    github_installation_id: int = 0
+    github_webhook_secret: str = ""
 
     # ── Agent tuning ───────────────────────────────────────────────────────────
     max_retries: int = 3

@@ -25,7 +25,7 @@ services:
     ports:
       - "6379:6379"
     volumes:
-      - ${VOLUME_MOUNT_PATH}/redis:/data
+      - redis_data:/data
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -41,7 +41,7 @@ services:
       MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME}
       MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD}
     volumes:
-      - ${VOLUME_MOUNT_PATH}/mongo:/data/db
+      - mongo_data:/data/db
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
       interval: 5s
@@ -58,10 +58,15 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: vectordb
     volumes:
-      - ${VOLUME_MOUNT_PATH}/postgres:/var/lib/postgresql/data
+      - postgres_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d vectordb"]
       interval: 5s
       timeout: 3s
       retries: 5
     restart: unless-stopped
+
+volumes:
+  redis_data:
+  mongo_data:
+  postgres_data:
