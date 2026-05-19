@@ -9,6 +9,7 @@ from authlib.integrations.base_client.errors import OAuthError
 from flask import Blueprint, abort, jsonify, url_for
 from flask_login import current_user, login_required, login_user, logout_user
 
+from .crypto import encrypt_token
 from .db import get_db
 from .models import User, upsert_user
 from .oauth import ALLOWED_PROVIDERS, oauth
@@ -161,7 +162,8 @@ def callback(provider: str):
         return jsonify({"error": "Failed to retrieve user profile from provider."}), 502
 
     from config import get_settings
-    db = get_db(get_settings().mongodb_uri)
+    s = get_settings()
+    db = get_db(s.mongodb_uri)
 
     doc = upsert_user(
         db,
@@ -170,7 +172,10 @@ def callback(provider: str):
         username=normalized["username"],
         email=normalized["email"],
         avatar_url=normalized["avatar_url"],
-        access_token=token.get("access_token", ""),
+        access_token=encrypt_token(
+            token.get("access_token", ""),
+            s.flask_secret_key.get_secret_value(),
+        ),
     )
 
     user = User(doc)
