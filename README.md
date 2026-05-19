@@ -5,20 +5,49 @@ A LangGraph state machine that reads a GitHub issue, uses Claude to generate and
 ## How it works
 
 ```
-read_issue → code → generate_tests → test ──(pass)──► create_pr
-                        ▲                  │
-                        └──(fail, retry)───┘
-                                           │
-                                    (max retries)
-                                           ▼
-                                       fail_state
+load_project_context → read_issue → code → generate_tests → test ──(pass)──► create_pr
+                                                   ▲                  │
+                                                   └──(fail, retry)───┘
+                                                                      │
+                                                               (max retries)
+                                                                      ▼
+                                                                  fail_state
 ```
 
-1. **read_issue** — fetches the issue title + body from GitHub
-2. **code** — Claude generates a Python solution based on the issue (and any prior test failures)
-3. **generate_tests** — Claude writes a pytest file for the generated solution
-4. **test** — runs both files inside an isolated Docker container
-5. **create_pr** — creates a branch, commits the code, pushes, and opens a PR
+1. **load_project_context** — loads or generates project context (file structure, functions, patterns) from cache or generates it on first run. Uses Redis for KV cache and PostgreSQL vector DB for context storage.
+2. **read_issue** — fetches the issue title + body from GitHub
+3. **code** — Claude generates a Python solution based on the issue (and any prior test failures), with access to project context
+4. **generate_tests** — Claude writes a pytest file for the generated solution
+5. **test** — runs both files inside an isolated Docker container
+6. **create_pr** — creates a branch, commits the code, pushes, and opens a PR
+
+### Context Loading Strategy
+
+The `load_project_context` node implements intelligent context management:
+
+**On first execution:**
+- Reads repository structure (files, directories, code organization)
+- Extracts functions, classes, and code patterns via ast-grep
+- Generates a comprehensive project summary
+- Applies context compression strategies (summarization, token filtering, selective storage)
+- Caches context in Redis (KV cache) and PostgreSQL vector DB
+
+**On subsequent executions (same session):**
+- Retrieves context from Redis cache
+- Uses vector DB for semantic similarity search if needed
+- Injects project context into LLM prompts
+
+**Cache invalidation:**
+- Once per execution (fresh context per agent run)
+- Allows Claude to work with latest project knowledge without stale context
+
+**Context content includes:**
+- File structure and organization
+- Function definitions and signatures
+- Class definitions and hierarchies
+- Import patterns and dependencies
+- Code conventions and patterns
+- Project metadata (language, framework, structure)
 
 ## Prerequisites
 
@@ -131,6 +160,8 @@ All settings live in `.env` (see `.env.example` for the full list):
 | `MAX_RETRIES` | `3` | Max code/test iterations before giving up |
 | `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use |
 | `BASE_BRANCH` | `main` | Default PR target branch |
+| `REDIS_URL` | `redis://localhost:6379` | Redis connection for KV cache |
+| `POSTGRES_VEC_URL` | — | PostgreSQL vector DB connection for context storage |
 
 ## Project structure
 
@@ -148,5 +179,7 @@ All settings live in `.env` (see `.env.example` for the full list):
 └── tools/
     ├── executor.py       # Runs code + tests inside Docker
     ├── github.py         # GitHub API calls (fetch issue, open PR)
-    └── git_ops.py        # Git branch, commit, push operations
+    ├── git_ops.py        # Git branch, commit, push operations
+    ├── ast_grep.py       # ast-grep CLI wrapper for code searching
+    └── langchain_tools.py# LangChain tool definitions for code search
 ```

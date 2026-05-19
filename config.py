@@ -5,6 +5,7 @@ from pathlib import Path
 
 from langchain_anthropic import ChatAnthropic
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from tools.langchain_tools import get_code_search_tools
 
 
 class Settings(BaseSettings):
@@ -65,3 +66,12 @@ llm = ChatAnthropic(
     api_key=settings.anthropic_api_key,
     max_tokens=4096,
 )
+
+
+def get_llm_with_tools():
+    """Returns LLM client with code search tools bound.
+
+    Used by llm_nodes for code generation with access to project structure.
+    """
+    tools = get_code_search_tools()
+    return llm.bind_tools(tools)
