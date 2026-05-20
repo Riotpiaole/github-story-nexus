@@ -7,14 +7,25 @@ log = logging.getLogger(__name__)
 
 DOCKER_IMAGE = "story-pr-runner"
 
+_TEST_COMMANDS: dict[str, list[str]] = {
+    "pytest":    ["pytest", "test_solution.py", "-v", "--tb=short"],
+    "unittest":  ["python", "-m", "unittest", "test_solution", "-v"],
+    "jest":      ["npx", "jest", "test_solution", "--no-coverage"],
+    "mocha":     ["npx", "mocha", "test_solution.js"],
+    "go test":   ["go", "test", "./..."],
+    "cargo":     ["cargo", "test"],
+}
 
-def execute_python_tests(solution_code: str, test_code: str) -> dict:
-    """Writes solution + test files to a temp dir and runs pytest inside a
-    Docker container with no network access and capped resources.
+
+def execute_tests(solution_code: str, test_code: str, test_runner: str = "pytest") -> dict:
+    """Writes solution + test files to a temp dir and runs the appropriate test
+    command inside a Docker container with no network access and capped resources.
 
     Args:
-        solution_code: Python code to be tested.
-        test_code: Pytest test code.
+        solution_code: Solution code to be tested.
+        test_code: Unit test code targeting the solution.
+        test_runner: Test runner key from project skills (e.g. 'pytest', 'jest').
+                     Defaults to 'pytest' when not detected from skills.
 
     Returns:
         Dict with 'success' bool and 'output' str containing test results.
@@ -22,12 +33,14 @@ def execute_python_tests(solution_code: str, test_code: str) -> dict:
     Build the runner image once with:
         docker build -t story-pr-runner -f Dockerfile.runner .
     """
+    cmd = _TEST_COMMANDS.get(test_runner, _TEST_COMMANDS["pytest"])
+
     with tempfile.TemporaryDirectory() as tmpdir:
         tmppath = Path(tmpdir)
         (tmppath / "solution.py").write_text(solution_code)
         (tmppath / "test_solution.py").write_text(test_code)
 
-        log.info("Running tests inside Docker container (image=%s)...", DOCKER_IMAGE)
+        log.info("Running tests inside Docker container (image=%s, runner=%s)...", DOCKER_IMAGE, test_runner)
         try:
             result = subprocess.run(
                 [
@@ -37,7 +50,7 @@ def execute_python_tests(solution_code: str, test_code: str) -> dict:
                     "--cpus", "0.5",
                     "-v", f"{tmpdir}:/code",
                     DOCKER_IMAGE,
-                    "pytest", "test_solution.py", "-v", "--tb=short",
+                    *cmd,
                 ],
                 capture_output=True,
                 text=True,

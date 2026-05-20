@@ -88,10 +88,18 @@ configure_logging()
 
 log = logging.getLogger(__name__)
 
+_AGENT_MAX_TOKENS = 5000
+
 llm = ChatAnthropic(
     model=settings.llm_model,
     api_key=settings.anthropic_api_key,
     max_tokens=4096,
+)
+
+_bounded_llm = ChatAnthropic(
+    model=settings.llm_model,
+    api_key=settings.anthropic_api_key,
+    max_tokens=_AGENT_MAX_TOKENS,
 )
 
 
@@ -102,3 +110,13 @@ def get_llm_with_tools():
     """
     tools = get_code_search_tools()
     return llm.bind_tools(tools)
+
+
+def get_bounded_llm_with_tools():
+    """Returns 5000-token-capped LLM with code search tools. Used by the coder."""
+    return _bounded_llm.bind_tools(get_code_search_tools())
+
+
+def get_bounded_llm():
+    """Returns 5000-token-capped plain LLM. Used by the tester."""
+    return _bounded_llm
