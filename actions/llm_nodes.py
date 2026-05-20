@@ -1,25 +1,41 @@
 import logging
+from pathlib import Path
 
+from langchain_core.messages import ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 
-from config import llm, settings
+from config import get_llm_with_tools, settings
 from state import AgentState
 from tools.executor import execute_python_tests
+from tools.langchain_tools import get_code_search_tools
 
 log = logging.getLogger(__name__)
 
+_PROMPTS_DIR = Path(__file__).parent
+_MAX_LOOP_ITERATIONS = 10
+
+CODE_GENERATION_TOKEN_LIMIT = 5000
+
+
+def _load_prompt(filename: str, **kwargs) -> str:
+    raw = (_PROMPTS_DIR / filename).read_text()
+    return raw.format(**kwargs) if kwargs else raw
+
+
+
+
 _CODE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", (
-        "You are an expert software engineer. Write clean Python code that solves the user's issue.\n"
-        "You have access to code search tools to understand the project structure. "
-        "Use them to find existing patterns, functions, and conventions before generating code.\n"
-        "After searching (if needed), output ONLY valid, executable Python code. No markdown fences, no explanations."
+    ("system", _load_prompt(
+        "coder_prompt.md",
+        token_limit=CODE_GENERATION_TOKEN_LIMIT,
+        constraints="output ONLY valid, executable code — no markdown fences, no explanations",
     )),
     ("user", (
         "GitHub Issue:\n{issue}\n\n"
         "Previous test failure (empty if first attempt):\n{test_feedback}"
     )),
 ])
+
 
 _TEST_PROMPT = ChatPromptTemplate.from_messages([
     ("system", (
@@ -36,6 +52,39 @@ _TEST_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
+def _run_agentic_loop(
+    prompt: ChatPromptTemplate,
+    variables: dict,
+    repo_path: str,
+) -> str:
+    llm_with_tools = get_llm_with_tools()
+    tools = {t.name: t for t in get_code_search_tools()}
+    messages = prompt.format_messages(**variables)
+
+    for iteration in range(_MAX_LOOP_ITERATIONS):
+        response = llm_with_tools.invoke(messages)
+        messages.append(response)
+
+        if not response.tool_calls:
+            return response.content
+
+        log.info("Loop iteration %d: executing %d tool call(s).", iteration + 1, len(response.tool_calls))
+        for call in response.tool_calls:
+            fn = tools.get(call["name"])
+            if fn is None:
+                result = f"Unknown tool: {call['name']}"
+            else:
+                result = fn.invoke({**call["args"], "repo_path": repo_path})
+            messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
+
+    log.warning("Agentic loop reached max iterations (%d).", _MAX_LOOP_ITERATIONS)
+    for msg in reversed(messages):
+        if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
+            return msg.content
+    return ""
+
+
+
 def code_solution(state: AgentState) -> dict:
     """Generates Python solution code using Claude.
 
@@ -45,9 +94,11 @@ def code_solution(state: AgentState) -> dict:
     log.info("Generating solution with Claude (attempt %d/%d)...", state["retry_count"] + 1, settings.max_retries)
     feedback = state.get("test_results") or "None — this is the first attempt."
 
+
     code = _run_agentic_loop(
         _CODE_PROMPT,
         {
+            "summary": state["project_context"],
             "issue": state["issue_details"],
             "test_feedback": feedback,
         },
