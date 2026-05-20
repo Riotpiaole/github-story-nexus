@@ -16,12 +16,18 @@ from config import llm
 
 log = logging.getLogger(__name__)
 
+_CACHE_KEY = "ctx:{user_id}:{safe_repo}"
+
 _SYMBOL_STRIP = re.compile(r'[#*`>_\-|\\]')
 _WHITESPACE_COLLAPSE = re.compile(r'\s+')
 
 _SKILLS_PATTERN = re.compile(r'^(\w+):\s*["\']?([^"\'#\n]+?)["\']?\s*$')
 _IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
 _NOISE_TOKENS = re.compile(r'\b(__pycache__|\.pyc|\.DS_Store|Thumbs\.db)\b')
+
+_MISSING_README = "(no README found)"
+_MISSING_DEPENDENCY_MANIFEST = "(no dependency manifest found)"
+_MISSING_ENTRY_POINT = "(no entry point found)"
 
 _PRUNE_LIMIT = 10
 _README_MAX_BYTES = 10 * 1024 * 1024  # 10 MB
@@ -30,16 +36,28 @@ _DEPENDENCY_MAX_LINES = 80
 _ENTRY_POINT_MAX_LINES = 60
 _FILE_TREE_MAX_LINES = 100
 
-_README_SUMMARIZE_PROMPT = (
-    "You are a senior software engineer. Given a README and a GitHub issue, "
-    "return ONLY a raw JSON object with exactly two keys — no markdown fences, no extra text:\n\n"
-    '"readMeContent": a summary (150 words or fewer) of what the project does, '
-    "its main features, and how the issue relates to it.\n"
-    '"language": the single ast-grep language identifier best suited for solving the issue '
-    "(one of: python, javascript, typescript, go, rust, java, ruby).\n\n"
-    "## README\n{readme}\n\n"
-    "## GitHub Issue\n{issue_content}"
-)
+_README_SUMMARIZE_PROMPT = """\
+You are a senior software engineer acting as a planning agent.
+
+Given the project README and a GitHub issue, analyze both and return ONLY a \
+raw JSON object — no markdown fences, no extra text — with exactly these two keys:
+
+"readMeContent": A concise summary (150 words or fewer) covering:
+  - What the project does and its main purpose
+  - Key architectural components or technologies used
+  - How the issue relates to the project and what area of the codebase it likely touches
+
+"language": The single ast-grep language identifier required to resolve the issue.
+  Choose from: python, javascript, typescript, go, rust, java, ruby
+  Base this on the primary implementation language visible in the README (build tools,
+  import examples, file extensions mentioned) and the nature of the issue.
+
+## README
+{readme}
+
+## GitHub Issue
+{issue_content}
+"""
 
 # Candidate dependency manifests, checked in priority order per language family
 _DEPENDENCY_FILES: list[str] = [
@@ -236,14 +254,22 @@ def _read_readme(repo_path: Path, issue_content: str) -> dict:
 
         try:
             log.info("Summarising README '%s' (%.1f KB)...", name, size / 1024)
-            prompt = _README_SUMMARIZE_PROMPT.format(readme=raw)
+            prompt = _README_SUMMARIZE_PROMPT.format(
+                readme=raw,
+                issue_content=issue_content,
+            )
             response = llm.invoke([HumanMessage(content=prompt)])
-            return response.content.strip()
+            parsed = json.loads(response.content.strip())
+            log.info("Language inferred from README: %s", parsed.get("language"))
+            return parsed
+        except json.JSONDecodeError as e:
+            log.warning("LLM returned non-JSON for README '%s': %s", name, e)
+            return {"readMeContent": raw[:_README_FALLBACK_CHARS], "language": "python"}
         except Exception as e:
             log.warning("LLM failed to summarise README '%s': %s", name, e)
-            return raw[:_README_FALLBACK_CHARS]
+            return {"readMeContent": raw[:_README_FALLBACK_CHARS], "language": "python"}
 
-    return "(no README found)"
+    return _MISSING_README
 
 
 def _read_dependencies(repo_path: Path) -> str:
@@ -255,7 +281,7 @@ def _read_dependencies(repo_path: Path) -> str:
         content = _read_text(candidate)
         if content:
             return f"### {name}\n" + "\n".join(content.splitlines()[:_DEPENDENCY_MAX_LINES])
-    return "(no dependency manifest found)"
+    return _MISSING_DEPENDENCY_MANIFEST
 
 
 def _read_entry_point(repo_path: Path) -> str:
@@ -267,7 +293,7 @@ def _read_entry_point(repo_path: Path) -> str:
         content = _read_text(candidate)
         if content:
             return f"### {name}\n" + "\n".join(content.splitlines()[:_ENTRY_POINT_MAX_LINES])
-    return "(no entry point found)"
+    return _MISSING_ENTRY_POINT
 
 
 def _token_filter(lines: list[str]) -> list[str]:
@@ -320,7 +346,16 @@ def load_context(state: AgentState) -> dict:
     
     # --- Gather README (+ language inference), dependencies, and entry point ---
     readme = _read_readme(repo_path, issue_content)
-    language = readme["language"]
+    if readme == _MISSING_README:
+        raise FileNotFoundError(
+            f"No README found in '{repo_path}'. "
+            "Add a README.md (or README.rst / README.txt) to the repository root so the agent "
+            "can summarise the project and infer the target language."
+        )
+    else:
+        language = readme["language"]
+
+        
     dependencies = _read_dependencies(repo_path)
     entry_point = _read_entry_point(repo_path)
 
@@ -373,7 +408,10 @@ def _make_context_key(user_id: str, repo_name: str) -> str:
     (e.g. append commit SHA for per-commit caching).
     """
     safe_repo = repo_name.replace("/", "_")
-    return f"ctx:{user_id}:{safe_repo}"
+    return _CACHE_KEY.format(
+        user_id=user_id,
+        safe_repo=safe_repo,
+    )
 
 
 def load_project_context(state: AgentState) -> dict:
