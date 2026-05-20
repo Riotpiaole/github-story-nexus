@@ -7,28 +7,31 @@ A **generic issue-to-PR generator** that automatically reads GitHub issues, gene
 This tool transforms GitHub issues into complete pull requests through an intelligent, project-aware workflow:
 
 ```
-load_project_context ──(repo mismatch)────────────────────► fail_state
+load_project_context ──(repo mismatch)──────────────────────────────► fail_state
         │
         ▼
-   read_issue → code → generate_tests → test ──(pass)──► create_pr
-                  ▲                      │
-                  └──(fail, retry)───────┘
-                                         │
-                                  (max retries)
-                                         ▼
-                                     fail_state
+   read_issue → plan → code → test ──(pass)──────────────────────► create_pr
+                         ▲     │
+                         │     └──(fail)──► tester ──(APPROVED)──► create_pr
+                         │                    │
+                         └──(NEEDS_WORK, retry remaining)
+                                              │
+                                       (max iterations)
+                                              ▼
+                                          fail_state
 ```
 
 `load_project_context` bundles repo validation, skills loading, and context generation. If the `--repo` flag does not match the remote origin, the workflow routes immediately to `fail_state` without proceeding further.
 
 ### Workflow Stages
 
-1. **load_project_context** — Validates the repo, loads skills, and generates project understanding. Fails immediately with exit code 1 if `--repo` does not match the remote origin.
+1. **load_project_context** — Validates the repo, loads skills, and generates a compressed project summary (cached in Redis → PostgreSQL). Fails immediately if `--repo` does not match the remote origin.
 2. **read_issue** — Fetches issue title + body from GitHub
-3. **code** — Claude generates solution using skills + project context
-4. **generate_tests** — Claude writes tests matching project conventions
-5. **test** — Runs code + tests in isolated Docker sandbox
-6. **create_pr** — Creates branch, commits, pushes, opens PR
+3. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; no codebase re-exploration
+4. **code** — Agentic loop: Claude generates both the solution and unit tests together, guided by the plan; uses codebase search tools (ast-grep) and receives tester feedback on retry
+5. **test** — Runs solution + unit tests in an isolated Docker sandbox using the project's detected test runner
+6. **tester** — On failure: analyzes execution output and produces a structured verdict — `APPROVED` (solution is correct, early-terminate to PR) or `NEEDS_WORK` (feedback for the coder to iterate on)
+7. **create_pr** — Creates branch, commits, pushes, opens PR
 
 ## Quick Start
 
@@ -263,27 +266,33 @@ This context is:
 - **Compressed** to control LLM token usage
 - **Injected into prompts** to guide code generation
 
+### Planning
+
+Before writing any code, the agent runs a single LLM call against the cached `project_context` and the GitHub issue to produce a structured implementation plan (approach selection, affected components, ordered steps, risk assessment). The planner never re-explores the codebase — the cached context is sufficient.
+
 ### Code Generation with Skills
 
-Claude receives:
-- GitHub issue details
-- Detected project skills (language, framework, test runner)
-- Project context and patterns
-- Available code search tools (ast-grep)
+The coder receives the implementation plan, issue details, and project context. It runs an agentic loop (up to 10 iterations) with access to codebase search tools (ast-grep) and outputs **both** the solution and unit tests in one pass:
 
-It generates code that:
-- Matches the detected language and framework
-- Follows project conventions and patterns
-- Is structured for the test framework
-- Uses appropriate idioms and best practices
+```
+### SOLUTION
+<solution code>
 
-### Iterative Testing
+### TESTS
+<unit test code>
+```
 
-Generated code is:
-1. Tested immediately in isolated Docker sandbox
-2. If tests fail, failure output is fed back to Claude
-3. Claude iterates on the solution (max retries)
-4. When tests pass, PR is automatically created
+On retry, the coder also receives the tester's structured feedback and revises both outputs accordingly. Each LLM call in the coder loop is capped at **5000 output tokens** to control cost.
+
+### Iterative Coder-Tester Loop
+
+After each code generation:
+1. Solution + unit tests are executed in an isolated Docker sandbox using the project's detected test runner (`skills.test_runner`)
+2. On failure, the **tester** analyzes the execution output and emits a verdict:
+   - `VERDICT: APPROVED` — solution satisfies the issue requirements (e.g. tests were wrong but code is correct); skips further iteration and goes straight to PR creation
+   - `VERDICT: NEEDS_WORK` — provides root cause, solution issues, test issues, and concrete suggestions for the coder
+3. The coder retries with the tester's feedback until tests pass, an APPROVED verdict is received, or `MAX_RETRIES` is exhausted
+4. The tester is also capped at **5000 output tokens** per call
 
 ## Environment Variables
 
@@ -295,8 +304,8 @@ Generated code is:
 | `GITHUB_PRIVATE_KEY_PATH` | — | Path to GitHub App private key |
 | `GITHUB_INSTALLATION_ID` | — | GitHub App installation ID |
 | `GITHUB_WEBHOOK_SECRET` | — | HMAC secret for webhook requests |
-| `MAX_RETRIES` | `3` | Max code generation attempts before giving up |
-| `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use for generation |
+| `MAX_RETRIES` | `3` | Max full coder→tester iterations before giving up |
+| `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use for all LLM calls |
 | `BASE_BRANCH` | `main` | Default PR target branch |
 | `REDIS_URL` | `redis://localhost:6379` | Redis — L1 context cache (60 s TTL) |
 | `POSTGRES_VEC_URL` | `postgresql://…/vectordb` | PostgreSQL — L2 context cache (persistent fallback) |
@@ -319,8 +328,11 @@ Generated code is:
 ├── .env.example                    # Environment variable template
 ├── actions/
 │   ├── git_nodes.py               # Git operations (read issue, create PR)
-│   ├── llm_nodes.py               # LLM code generation with tools
-│   └── context_nodes.py           # Repo validation, skills loading, context gen
+│   ├── llm_nodes.py               # LLM nodes: planner, coder, tester, test runner
+│   ├── context_nodes.py           # Repo validation, skills loading, context gen
+│   ├── planner_prompt.md          # Structured planning prompt (PLAN MODE)
+│   ├── coder_prompt.md            # Code + unit test generation prompt
+│   └── tester_prompt.md           # Generic failure analysis prompt (APPROVED / NEEDS_WORK)
 ├── cache/
 │   ├── __init__.py                # Public API: get_cache()
 │   ├── _manager.py                # Two-level cache orchestration (L1 → L2)

@@ -36,9 +36,10 @@ This document describes the design and architecture of story-pr-agent.
 │  └──────────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │  LLM Nodes (actions/llm_nodes.py)                        │   │
-│  │  - code_solution: Claude generates code (with tools)     │   │
-│  │  - generate_tests: Claude generates tests                │   │
+│  │  - plan_solution: Single LLM call → implementation plan  │   │
+│  │  - code_solution: Agentic loop → solution + unit tests   │   │
 │  │  - test_code: Execute in Docker sandbox                  │   │
+│  │  - tester_review: Failure analysis → APPROVED/NEEDS_WORK │   │
 │  └──────────────────────────────────────────────────────────┘   │
 └────────────────────┬────────────────────────────────────────────┘
                      │
@@ -101,49 +102,59 @@ START
   ├─► read_issue
   │   ├─ Call: GitHub API to fetch issue
   │   ├─ Read: issue title and body
-  │   └─ Return: {issue_details: formatted_string, ...}
+  │   └─ Return: {issue_details: formatted_string, retry_count: 0, max_retries: N}
+  │
+  ├─► plan_solution
+  │   ├─ Call: Plain LLM (no tools) — project_context already complete
+  │   │   ├─ Input: issue_details, project_context
+  │   │   └─ Output: Structured plan (approaches, steps, risks)
+  │   └─ Return: {implementation_plan: plan_text}
   │
   ├─► code_solution (ITERATIVE)
-  │   ├─ Call: Claude with agentic loop
-  │   │   ├─ Input: issue_details, skills, project_context
+  │   ├─ Call: Claude with agentic loop (max 10 tool iterations, 5000 token cap)
+  │   │   ├─ Input: implementation_plan, issue_details, project_context, tester_feedback
   │   │   ├─ Tools: find_functions, search_code_patterns
-  │   │   └─ Output: Generated code
-  │   └─ Return: {code_snippet: generated_code}
-  │
-  ├─► generate_tests
-  │   ├─ Call: Claude with agentic loop
-  │   │   ├─ Input: issue_details, code_snippet, skills
-  │   │   └─ Output: Generated test code
-  │   └─ Return: {test_code: generated_tests}
+  │   │   └─ Output: "### SOLUTION\n<code>\n### TESTS\n<tests>"
+  │   ├─ Parse: Split output into code_snippet and test_code
+  │   └─ Return: {code_snippet: solution_code, test_code: unit_tests}
   │
   ├─► test_code
-  │   ├─ Call: Docker executor
-  │   │   ├─ Mount: code_snippet, test_code into container
-  │   │   ├─ Run: test_runner command (pytest, jest, etc.)
-  │   │   └─ Return: success/failure + output
+  │   ├─ Call: Docker executor with skills.test_runner dispatch
+  │   │   ├─ Mount: solution.py, test_solution.py into container
+  │   │   ├─ Run: command from _TEST_COMMANDS[test_runner]
+  │   │   └─ Return: success/failure + raw output
   │   ├─ If success:
-  │   │   └─ Return: {status: "success", ...}
-  │   ├─ If failure AND retries remaining:
-  │   │   └─ Return: {status: "retry", test_results: error_output, ...}
-  │   └─ [Conditional routing via route_after_test()]
+  │   │   └─ Return: {status: "success", test_results: output}
+  │   └─ If failure:
+  │       └─ Return: {status: "retry", test_results: error_output}
+  │       └─ [route_after_test() → tester_review]
   │
-  ├─► [route_after_test() decision]
-  │   ├─ If status="success"
-  │   │   └─► create_pr
-  │   ├─ If status="retry" AND retry_count < max_retries
-  │   │   └─► code_solution (loop back)
-  │   └─ Else
-  │       └─► handle_failure
+  ├─► tester_review (on test failure)
+  │   ├─ Call: Plain LLM (5000 token cap)
+  │   │   ├─ Input: implementation_plan, code_snippet, test_code, test_runner, test_results
+  │   │   └─ Output: "VERDICT: APPROVED|NEEDS_WORK\n<feedback>"
+  │   ├─ Parse: Extract verdict from first line
+  │   ├─ Increment: retry_count
+  │   ├─ If APPROVED (early termination):
+  │   │   └─ Return: {status: "tester_approved", tester_feedback: response}
+  │   └─ If NEEDS_WORK:
+  │       └─ Return: {tester_feedback: structured_feedback}
+  │       └─ [route_after_tester() → code_solution or handle_failure]
   │
-  ├─► create_pr (on success)
+  ├─► [route_after_tester() decision]
+  │   ├─ If status="tester_approved"  → create_pr (early termination)
+  │   ├─ If retry_count < max_retries → code_solution (loop with feedback)
+  │   └─ Else                         → handle_failure
+  │
+  ├─► create_pr (on success or tester APPROVED)
   │   ├─ Create: New branch (fix/issue-N)
-  │   ├─ Commit: Code changes
+  │   ├─ Commit: solution_issue_N.py
   │   ├─ Push: To origin
   │   ├─ Open: Pull request
   │   └─ Return: {status: "pr_created", pr_url: ...}
   │
-  ├─► handle_failure (on max retries exceeded)
-  │   ├─ Log: Error details
+  ├─► handle_failure (on max iterations exceeded)
+  │   ├─ Log: retry_count and last tester_feedback
   │   └─ Return: {status: "failed"}
   │
   └─► END
@@ -251,70 +262,131 @@ def repo_validation(state):
 
 **Why**: Prevents accidental PR creation, ensures data consistency, protects repository integrity.
 
-### 6. Agentic Loop for Code Generation
+### 6. Planning Before Coding
 
-**Design**: Claude can call tools (code search) iteratively.
+**Design**: A dedicated `plan_solution` node runs before `code_solution` using a single plain LLM call (no tools).
+
+```
+issue_details + project_context
+        ↓
+   plan_solution (plain LLM)
+        ↓
+  implementation_plan (structured text)
+  - selected approach
+  - affected components
+  - ordered steps
+  - risks & mitigations
+```
+
+**Why**: Separates reasoning from implementation. The planner uses the cached `project_context` as-is — no codebase re-exploration — keeping it cheap and fast. The coder receives a concrete plan rather than reasoning from scratch each iteration.
+
+### 7. Coder Owns Both Solution and Tests
+
+**Design**: `code_solution` outputs a delimited response containing both artifacts.
+
+```
+### SOLUTION
+<solution code>
+
+### TESTS
+<unit test code>
+```
+
+`_parse_coder_output()` splits on the `### TESTS` delimiter. On retry, the coder revises **both** together guided by tester feedback.
+
+**Why**: The coder understands the solution intent better than a separate test-writer agent. Keeping both in one pass means the tests always reflect the current solution's structure and imports. It also eliminates a separate `generate_tests` LLM call per iteration.
+
+### 8. Agentic Loop for Code Generation
+
+**Design**: Claude can call tools (code search) iteratively within `_run_agentic_loop`.
 
 ```python
-def _run_agentic_loop(prompt, input_vars, repo_path):
-    while True:
-        response = llm_with_tools.invoke(...)
-        if response.tool_calls:
-            for tool_call in response.tool_calls:
-                result = execute_tool(tool_call)
-                messages.append(ToolMessage(result))
-        else:
-            return response.content  # Final code
+def _run_agentic_loop(prompt, variables, repo_path):
+    messages = prompt.format_messages(**variables)
+    for _ in range(_MAX_LOOP_ITERATIONS):       # max 10
+        response = llm_with_tools.invoke(messages)
+        if not response.tool_calls:
+            return response.content             # final output
+        for call in response.tool_calls:
+            result = tools[call["name"]].invoke(...)
+            messages.append(ToolMessage(result))
 ```
 
-**Why**: Claude can search for existing functions, classes, patterns before generating. Improves quality and consistency.
+Both `plan_solution` and `tester_review` use plain `llm.invoke()` — no loop — because they only reason, not search.
 
-### 7. Error Recovery via Iteration
+**Why**: The coder can locate existing functions, classes, and patterns before generating, improving consistency. The loop is bounded (max 10 iterations, 5000 output tokens per call) to control cost.
 
-**Design**: Test failures feed back to Claude for iteration.
+### 9. Tester as Failure Analyst with Early Termination
+
+**Design**: On test failure, `tester_review` runs before any coder retry. It emits a structured verdict on the first line.
 
 ```
-Claude generates code → Tests fail
-    ↓
-Extract error output
-    ↓
-Pass to Claude: "Previous attempt failed with: <error>"
-    ↓
-Claude generates improved code
-    ↓
-Retry (max 3 times)
+VERDICT: APPROVED   → solution is correct; tests were wrong → route to create_pr
+VERDICT: NEEDS_WORK → coder must fix; feedback follows below
 ```
 
-**Why**: Handles common issues (import errors, syntax errors, logic errors) automatically. Most issues are fixable with feedback.
+`route_after_tester()` reads `state["status"]` for `"tester_approved"` to trigger early termination, bypassing remaining iterations.
+
+**Why**: Raw test output (assertion errors, tracebacks) is noisy. The tester translates it into actionable root-cause analysis targeting the specific issue — solution bugs vs. test bugs. The APPROVED path prevents unnecessary retries when the solution is already correct but the generated tests were flawed.
+
+### 10. Token Caps for Agent Cost Control
+
+**Design**: Two LLM instances in `config.py`.
+
+```python
+llm          = ChatAnthropic(max_tokens=4096)   # planner, context nodes
+_bounded_llm = ChatAnthropic(max_tokens=5000)   # coder (agentic loop), tester
+```
+
+`get_bounded_llm_with_tools()` binds `_bounded_llm` for the coder agentic loop.  
+`get_bounded_llm()` returns `_bounded_llm` for the tester.
+
+**Why**: The coder loop runs up to 10 × max_retries times — unbounded output tokens would dominate cost. 5000 tokens is sufficient for a solution + unit tests. The planner uses the default 4096 cap since it is a single one-shot call.
 
 ## State Schema
 
 ```python
 class AgentState(TypedDict):
     # Input
-    user_id: str                             # authenticated user ID (cache key)
-    repo_name: str                           # "owner/repo"
-    issue_number: int                        # GitHub issue number
-    local_repo_path: str                     # /path/to/local/clone
-    base_branch: str                         # "main", "develop", etc.
-    
-    # Context
-    issue_details: str                       # Formatted issue (title + body)
-    skills: dict                             # {language, framework, ...}
-    project_context: str                     # Compressed project summary
-    
-    # Generated
-    code_snippet: str                        # Generated Python code
-    test_code: str                           # Generated pytest code
-    
-    # Execution
-    test_results: str                        # Test output (pass/fail details)
-    retry_count: int                         # Current retry attempt
-    max_retries: int                         # Max allowed retries
-    
+    user_id: str              # authenticated user ID (cache key scope)
+    repo_name: str            # "owner/repo"
+    issue_number: int         # GitHub issue number
+    local_repo_path: str      # /path/to/local/clone
+    base_branch: str          # "main", "develop", etc.
+
+    # Context (loaded once, cached L1→L2)
+    skills: dict              # {language, framework, test_runner, ...}
+    project_context: str      # compressed repo summary (cached)
+    issue_details: str        # formatted issue (title + body)
+
+    # Planning
+    implementation_plan: str  # structured plan from plan_solution
+
+    # Generated (coder outputs both together)
+    code_snippet: str         # solution code parsed from ### SOLUTION
+    test_code: str            # unit tests parsed from ### TESTS
+
+    # Execution & feedback loop
+    test_results: str         # raw Docker execution output
+    tester_feedback: str      # structured analysis from tester_review
+    retry_count: int          # incremented by tester_review per full iteration
+    max_retries: int          # initialized by read_github_issue
+
     # Output
-    status: str                              # "success", "retry", "failed"
-    pr_url: str                              # URL of created PR
+    status: str               # "success" | "retry" | "tester_approved" | "failed" | "pr_created"
+    pr_url: str               # URL of opened PR
+```
+
+### Status Transitions
+
+```
+read_issue        → (no status set)
+test_code (pass)  → status = "success"        → route_after_test → create_pr
+test_code (fail)  → status = "retry"          → route_after_test → tester_review
+tester_review     → status = "tester_approved" → route_after_tester → create_pr  (early exit)
+                   (NEEDS_WORK, no status change) → route_after_tester → code or fail_state
+handle_failure    → status = "failed"
+create_pr         → status = "pr_created"
 ```
 
 ## Language Support Strategy
@@ -338,11 +410,15 @@ The system supports multiple languages through:
 ## Performance Considerations
 
 ### Token Budget
-- **Context window**: 200K tokens (Claude Sonnet)
-- **System prompt**: ~200 tokens
-- **Project context**: ~500 tokens (compressed)
-- **Issue + code**: ~1000 tokens
-- **Remaining**: ~198K tokens for flexibility
+
+| Node | LLM instance | Max output tokens | Calls per run |
+|---|---|---|---|
+| `load_project_context` | `llm` (4096) | 4096 | 2 (cache miss) / 0 (hit) |
+| `plan_solution` | `llm` (4096) | 4096 | 1 |
+| `code_solution` (each loop iteration) | `_bounded_llm` (5000) | 5000 | 1–10 per attempt |
+| `tester_review` | `_bounded_llm` (5000) | 5000 | 1 per retry |
+
+Worst-case total output tokens: `2×4096 + 1×4096 + (4 attempts × 10 iterations × 5000) + (3 reviews × 5000)` = **~227K output tokens**. The dominant cost driver is the coder agentic loop; reducing `_MAX_LOOP_ITERATIONS` (default 10) is the highest-leverage knob.
 
 ### Caching Strategy
 - **L1 Redis** — sub-millisecond retrieval, 60 s TTL auto-eviction
