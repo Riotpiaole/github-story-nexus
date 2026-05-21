@@ -25,6 +25,7 @@ import hashlib
 import logging
 import struct
 import zlib
+from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
@@ -107,24 +108,35 @@ def _deserialize_map(data: bytes) -> dict[str, bytes]:
     return store
 
 
-# ── L1: LocalCache — in-memory hashmap + persisted binary map file ────────────
+# ── L1: LocalCache — LRU-bounded in-memory store + persisted binary map file ──
+
+_MAX_ENTRIES = 100
+_MAX_BYTES   = 100 * 1024 * 1024  # 100 MB
+
 
 class LocalCache:
-    """In-memory dict[key → payload] backed by a single binary map file.
+    """LRU-bounded in-memory OrderedDict[key → payload] backed by a binary map file.
 
-    Lookups hit the dict (O(1)); writes update the dict then flush to disk.
+    Bounded by two independent limits — whichever is hit first triggers eviction:
+    - _MAX_ENTRIES (100): entry count
+    - _MAX_BYTES (100 MB): total compressed payload size
+
+    Lookups move the hit to the MRU end (O(1)).
+    Writes insert at MRU, then evict from the LRU end until both limits are satisfied.
     Collision detection and entry unpacking happen inside get/set.
     """
 
     def __init__(self, path: Path) -> None:
         self._path = path
-        self._store: dict[str, bytes] = {}
+        self._store: OrderedDict[str, bytes] = OrderedDict()
+        self._total_bytes: int = 0
         self._load()
 
     def get(self, key: str, compressed: bytes) -> str | None:
         payload = self._store.get(key)
         if payload is None:
             return None
+        self._store.move_to_end(key)
         try:
             stored_prompt, response = unpack_entry(payload)
             if stored_prompt != compressed:
@@ -136,23 +148,36 @@ class LocalCache:
             return None
 
     def set(self, key: str, compressed: bytes, response: str) -> None:
-        self._store[key] = pack_entry(compressed, response)
+        payload = pack_entry(compressed, response)
+        if key in self._store:
+            self._total_bytes -= len(self._store[key])
+        self._store[key] = payload
+        self._store.move_to_end(key)
+        self._total_bytes += len(payload)
+        self._evict()
         self._flush()
+
+    def _evict(self) -> None:
+        while self._store and (len(self._store) > _MAX_ENTRIES or self._total_bytes > _MAX_BYTES):
+            _, evicted = self._store.popitem(last=False)
+            self._total_bytes -= len(evicted)
 
     def _load(self) -> None:
         if not self._path.exists():
             return
         try:
-            self._store = _deserialize_map(self._path.read_bytes())
+            self._store = OrderedDict(_deserialize_map(self._path.read_bytes()))
+            self._total_bytes = sum(len(v) for v in self._store.values())
             log.debug("LLM local cache loaded %d entries from %s", len(self._store), self._path)
         except Exception as exc:
             log.warning("LLM local cache load error (%s): %s — starting empty", self._path, exc)
-            self._store = {}
+            self._store = OrderedDict()
+            self._total_bytes = 0
 
     def _flush(self) -> None:
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_bytes(_serialize_map(self._store))
+            self._path.write_bytes(_serialize_map(dict(self._store)))
         except Exception as exc:
             log.warning("LLM local cache flush error: %s", exc)
 

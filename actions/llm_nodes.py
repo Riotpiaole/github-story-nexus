@@ -1,9 +1,13 @@
+import json
 import logging
 from pathlib import Path
 
 from langchain_core.messages import ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 
+from cache import get_local_cache, make_cache_key
+from cache._redis import redis_get as _node_redis_get
+from cache._redis import redis_set as _node_redis_set
 from config import get_bounded_coder_llm_with_tools, get_bounded_llm, llm, settings
 from state import AgentState
 from tools.executor import execute_tests
@@ -47,6 +51,29 @@ _TESTER_PROMPT = ChatPromptTemplate.from_messages([
 
 
 _FILE_WRITE_TOOLS = {"write_file", "str_replace_in_file"}
+
+
+def _node_cache_get(key_str: str) -> dict | None:
+    local = get_local_cache()
+    key, compressed = make_cache_key(key_str)
+    raw = local.get(key, compressed)
+    if raw is not None:
+        log.debug("node cache L1 hit key=%s", key)
+        return json.loads(raw)
+    raw = _node_redis_get(settings.redis_url, key)
+    if raw is not None:
+        log.debug("node cache L2 hit key=%s — backfilling L1", key)
+        local.set(key, compressed, raw)
+        return json.loads(raw)
+    return None
+
+
+def _node_cache_set(key_str: str, value: dict) -> None:
+    local = get_local_cache()
+    key, compressed = make_cache_key(key_str)
+    raw = json.dumps(value)
+    local.set(key, compressed, raw)
+    _node_redis_set(settings.redis_url, key, raw)
 
 
 def _run_react_loop(
@@ -107,14 +134,23 @@ def plan_solution(state: AgentState) -> dict:
     """Generates a structured implementation plan from the issue and cached project context.
 
     Uses a plain LLM call (no tools) — project_context is already a complete repo summary.
+    Result is cached (L1 local + L2 Redis 60 s) so a downstream failure doesn't force a redo.
     """
+    key_str = f"node:plan:{state['user_id']}:{state['repo_name']}:{state['issue_number']}"
+    cached = _node_cache_get(key_str)
+    if cached is not None:
+        log.info("plan_solution: cache hit for issue #%d — skipping LLM call.", state["issue_number"])
+        return cached
+
     log.info("Planning solution for issue #%d...", state["issue_number"])
     messages = _PLAN_PROMPT.format_messages(
         issue=state["issue_details"],
         context=state["project_context"],
     )
     response = llm.invoke(messages)
-    return {"implementation_plan": response.content}
+    result = {"implementation_plan": response.content}
+    _node_cache_set(key_str, result)
+    return result
 
 
 def code_solution(state: AgentState) -> dict:
@@ -123,7 +159,22 @@ def code_solution(state: AgentState) -> dict:
     The agent reads existing files, applies targeted edits, then emits only
     ### TESTS in its final response. Modified file contents are concatenated
     into code_snippet for the sandboxed executor.
+
+    Result is cached per retry attempt (L1 local + L2 Redis 60 s). On a cache
+    hit, file writes are re-applied to the repo before returning so the working
+    tree is consistent even if the process recovered from a downstream failure.
     """
+    key_str = f"node:code:{state['user_id']}:{state['repo_name']}:{state['issue_number']}:{state['retry_count']}"
+    cached = _node_cache_get(key_str)
+    if cached is not None:
+        log.info("code_solution: cache hit (attempt %d) — restoring file writes.", state["retry_count"] + 1)
+        repo_path = Path(state["local_repo_path"])
+        for rel_path, content in cached.get("file_contents", {}).items():
+            target = repo_path / rel_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content)
+        return {k: cached[k] for k in ("modified_files", "code_snippet", "test_code")}
+
     log.info("Generating solution (attempt %d/%d)...", state["retry_count"] + 1, settings.max_retries)
     repo_path = Path(state["local_repo_path"])
     modified_files, test_code = _run_react_loop(
@@ -136,12 +187,17 @@ def code_solution(state: AgentState) -> dict:
         },
         str(repo_path),
     )
-    code_snippet = "\n\n".join(
-        f"# --- {f} ---\n{(repo_path / f).read_text()}"
+    file_contents = {
+        f: (repo_path / f).read_text()
         for f in modified_files
         if (repo_path / f).exists()
+    }
+    code_snippet = "\n\n".join(
+        f"# --- {f} ---\n{content}" for f, content in file_contents.items()
     )
-    return {"modified_files": modified_files, "code_snippet": code_snippet, "test_code": test_code}
+    result = {"modified_files": modified_files, "code_snippet": code_snippet, "test_code": test_code}
+    _node_cache_set(key_str, {**result, "file_contents": file_contents})
+    return result
 
 
 def test_code(state: AgentState) -> dict:
