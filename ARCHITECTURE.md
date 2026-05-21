@@ -37,7 +37,7 @@ This document describes the design and architecture of story-pr-agent.
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │  LLM Nodes (actions/llm_nodes.py)                        │   │
 │  │  - plan_solution: Single LLM call → implementation plan  │   │
-│  │  - code_solution: Agentic loop → solution + unit tests   │   │
+│  │  - code_solution: ReAct loop → in-place file edits       │   │
 │  │  - test_code: Execute in Docker sandbox                  │   │
 │  │  - tester_review: Failure analysis → APPROVED/NEEDS_WORK │   │
 │  └──────────────────────────────────────────────────────────┘   │
@@ -54,6 +54,11 @@ This document describes the design and architecture of story-pr-agent.
 │  │  Code Search    │  │  Testing     │  │  Context Gen       │  │
 │  │  (ast-grep)     │  │  (Docker)    │  │  & Compression     │  │
 │  └─────────────────┘  └──────────────┘  └────────────────────┘  │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  File Tools (ReAct coder)                                │   │
+│  │  - read_file, list_directory                             │   │
+│  │  - write_file, str_replace_in_file                       │   │
+│  └──────────────────────────────────────────────────────────┘   │
 └────────────────────────────────────────────────────────────────-┘
 ```
 
@@ -110,13 +115,16 @@ START
   │   │   └─ Output: Structured plan (approaches, steps, risks)
   │   └─ Return: {implementation_plan: plan_text}
   │
-  ├─► code_solution (ITERATIVE)
-  │   ├─ Call: Claude with agentic loop (max 10 tool iterations, 5000 token cap)
+  ├─► code_solution (ITERATIVE — ReAct loop)
+  │   ├─ Call: Claude with ReAct loop (max 10 tool iterations, 5000 token cap)
   │   │   ├─ Input: implementation_plan, issue_details, project_context, tester_feedback
-  │   │   ├─ Tools: find_functions, search_code_patterns
-  │   │   └─ Output: "### SOLUTION\n<code>\n### TESTS\n<tests>"
-  │   ├─ Parse: Split output into code_snippet and test_code
-  │   └─ Return: {code_snippet: solution_code, test_code: unit_tests}
+  │   │   ├─ Tools: find_functions, search_code_patterns (search)
+  │   │   │         read_file, list_directory (explore)
+  │   │   │         str_replace_in_file, write_file (edit in-place)
+  │   │   └─ Output (final text): "### TESTS\n<tests>" only
+  │   ├─ Track: each write_file/str_replace_in_file call → modified_files list
+  │   ├─ Read back: modified_files contents → concatenated as code_snippet for executor
+  │   └─ Return: {modified_files: [...], code_snippet: concatenated, test_code: unit_tests}
   │
   ├─► test_code
   │   ├─ Call: Docker executor with skills.test_runner dispatch
@@ -147,9 +155,12 @@ START
   │   └─ Else                         → handle_failure
   │
   ├─► create_pr (on success or tester APPROVED)
+  │   ├─ Stash: agent's in-place edits
+  │   ├─ Fetch + reset: sync base_branch from origin
   │   ├─ Create: New branch (fix/issue-N)
-  │   ├─ Commit: solution_issue_N.py
-  │   ├─ Push: To origin
+  │   ├─ Pop stash: restore agent edits onto feature branch
+  │   ├─ Stage: all paths in modified_files
+  │   ├─ Commit + Push: to origin
   │   ├─ Open: Pull request
   │   └─ Return: {status: "pr_created", pr_url: ...}
   │
@@ -280,41 +291,45 @@ issue_details + project_context
 
 **Why**: Separates reasoning from implementation. The planner uses the cached `project_context` as-is — no codebase re-exploration — keeping it cheap and fast. The coder receives a concrete plan rather than reasoning from scratch each iteration.
 
-### 7. Coder Owns Both Solution and Tests
+### 7. ReAct Coder: In-Place File Editing
 
-**Design**: `code_solution` outputs a delimited response containing both artifacts.
-
-```
-### SOLUTION
-<solution code>
-
-### TESTS
-<unit test code>
-```
-
-`_parse_coder_output()` splits on the `### TESTS` delimiter. On retry, the coder revises **both** together guided by tester feedback.
-
-**Why**: The coder understands the solution intent better than a separate test-writer agent. Keeping both in one pass means the tests always reflect the current solution's structure and imports. It also eliminates a separate `generate_tests` LLM call per iteration.
-
-### 8. Agentic Loop for Code Generation
-
-**Design**: Claude can call tools (code search) iteratively within `_run_agentic_loop`.
+**Design**: `code_solution` runs `_run_react_loop`, which gives Claude file read/write tools alongside the existing ast-grep search tools. The agent modifies existing repo files directly rather than generating a standalone snippet.
 
 ```python
-def _run_agentic_loop(prompt, variables, repo_path):
+def _run_react_loop(prompt, variables, repo_path):
+    tools = get_coder_tools()          # search + read_file + write_file + str_replace_in_file
+    modified_files = []
     messages = prompt.format_messages(**variables)
-    for _ in range(_MAX_LOOP_ITERATIONS):       # max 10
+    for _ in range(_MAX_LOOP_ITERATIONS):
         response = llm_with_tools.invoke(messages)
         if not response.tool_calls:
-            return response.content             # final output
+            test_code = response.content.partition("### TESTS")[2].strip()
+            return modified_files, test_code
         for call in response.tool_calls:
-            result = tools[call["name"]].invoke(...)
+            result = tools[call["name"]].invoke({**call["args"], "repo_path": repo_path})
             messages.append(ToolMessage(result))
+            if call["name"] in {"write_file", "str_replace_in_file"}:
+                modified_files.append(call["args"]["path"])
 ```
 
-Both `plan_solution` and `tester_review` use plain `llm.invoke()` — no loop — because they only reason, not search.
+The agent's final response contains only `### TESTS`. The modified files are read back and concatenated as `code_snippet` for the sandboxed executor. On retry, prior edits are already in place — the coder applies targeted `str_replace_in_file` fixes rather than rewriting from scratch.
 
-**Why**: The coder can locate existing functions, classes, and patterns before generating, improving consistency. The loop is bounded (max 10 iterations, 5000 output tokens per call) to control cost.
+**Why**: Real code modifications match how engineers actually work — reading existing code, making surgical edits — rather than producing a context-free snippet that then has to be spliced in. It also handles multi-file changes naturally via the `modified_files` list.
+
+### 8. Stash-Based Branch Creation
+
+**Design**: Because the ReAct agent writes files directly to `local_repo_path` before `create_pr` runs, a naive `git reset --hard` would destroy those changes. `create_branch_and_commit` uses a stash round-trip:
+
+```
+git stash --include-untracked   ← preserve agent edits
+git fetch + checkout + reset    ← sync to clean base_branch
+git checkout -b fix/issue-N     ← create feature branch
+git stash pop                   ← restore agent edits onto branch
+git add <modified_files>        ← stage only tracked paths
+git commit + push
+```
+
+**Why**: Keeps the branch creation deterministic (always starts from a fresh `base_branch`) while preserving in-place edits the ReAct agent made to arbitrary paths in the working tree.
 
 ### 9. Tester as Failure Analyst with Early Termination
 
@@ -362,9 +377,10 @@ class AgentState(TypedDict):
     # Planning
     implementation_plan: str  # structured plan from plan_solution
 
-    # Generated (coder outputs both together)
-    code_snippet: str         # solution code parsed from ### SOLUTION
-    test_code: str            # unit tests parsed from ### TESTS
+    # Generated (ReAct coder edits files in-place)
+    modified_files: list[str] # repo-relative paths written by the ReAct coder
+    code_snippet: str         # concatenated content of modified_files (for sandbox executor)
+    test_code: str            # unit tests from the coder's final ### TESTS response
 
     # Execution & feedback loop
     test_results: str         # raw Docker execution output
@@ -415,7 +431,7 @@ The system supports multiple languages through:
 |---|---|---|---|
 | `load_project_context` | `llm` (4096) | 4096 | 2 (cache miss) / 0 (hit) |
 | `plan_solution` | `llm` (4096) | 4096 | 1 |
-| `code_solution` (each loop iteration) | `_bounded_llm` (5000) | 5000 | 1–10 per attempt |
+| `code_solution` (each ReAct iteration) | `_bounded_llm` (5000) | 5000 | 1–10 per attempt |
 | `tester_review` | `_bounded_llm` (5000) | 5000 | 1 per retry |
 
 Worst-case total output tokens: `2×4096 + 1×4096 + (4 attempts × 10 iterations × 5000) + (3 reviews × 5000)` = **~227K output tokens**. The dominant cost driver is the coder agentic loop; reducing `_MAX_LOOP_ITERATIONS` (default 10) is the highest-leverage knob.
@@ -514,9 +530,9 @@ docker run -e ANTHROPIC_API_KEY=... -v $PWD:/workspace story-pr-agent:latest
 ## Future Enhancements
 
 1. **Vector DB semantic search** — Find similar code patterns
-2. **Multi-file generation** — Handle issues requiring multiple files
-3. **Breaking change detection** — Analyze API changes before generation
-4. **Coverage tracking** — Optimize test coverage over time
-5. **Cost tracking** — Monitor LLM usage and costs
-6. **Custom formatters** — Hook into project formatters (prettier, black, etc.)
-7. **Interactive mode** — Human-in-the-loop PR generation
+2. **Breaking change detection** — Analyze API changes before generation
+3. **Coverage tracking** — Optimize test coverage over time
+4. **Cost tracking** — Monitor LLM usage and costs
+5. **Custom formatters** — Hook into project formatters (prettier, black, etc.)
+6. **Interactive mode** — Human-in-the-loop PR generation
+7. **Multi-repo executor** — Mount actual repo into Docker sandbox instead of a temp dir copy

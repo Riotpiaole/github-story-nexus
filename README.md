@@ -28,7 +28,7 @@ load_project_context ──(repo mismatch)────────────�
 1. **load_project_context** — Validates the repo, loads skills, and generates a compressed project summary (cached in Redis → PostgreSQL). Fails immediately if `--repo` does not match the remote origin.
 2. **read_issue** — Fetches issue title + body from GitHub
 3. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; no codebase re-exploration
-4. **code** — Agentic loop: Claude generates both the solution and unit tests together, guided by the plan; uses codebase search tools (ast-grep) and receives tester feedback on retry
+4. **code** — ReAct loop: Claude explores the repo with `list_directory`/`read_file`, locates targets with ast-grep search tools, then edits files in-place via `str_replace_in_file`/`write_file`; outputs only unit tests in its final response
 5. **test** — Runs solution + unit tests in an isolated Docker sandbox using the project's detected test runner
 6. **tester** — On failure: analyzes execution output and produces a structured verdict — `APPROVED` (solution is correct, early-terminate to PR) or `NEEDS_WORK` (feedback for the coder to iterate on)
 7. **create_pr** — Creates branch, commits, pushes, opens PR
@@ -272,17 +272,18 @@ Before writing any code, the agent runs a single LLM call against the cached `pr
 
 ### Code Generation with Skills
 
-The coder receives the implementation plan, issue details, and project context. It runs an agentic loop (up to 10 iterations) with access to codebase search tools (ast-grep) and outputs **both** the solution and unit tests in one pass:
+The coder runs a **ReAct (Reason + Act)** loop — up to 10 tool iterations, 5000 output token cap — where it explores and edits the repository directly rather than generating a standalone snippet:
 
-```
-### SOLUTION
-<solution code>
+| Step | Tools used |
+|------|-----------|
+| Explore structure | `list_directory`, `read_file` |
+| Locate targets | `find_functions`, `search_code_patterns` |
+| Apply changes | `str_replace_in_file` (targeted edit), `write_file` (new file) |
+| Finish | Emits only `### TESTS <unit test code>` |
 
-### TESTS
-<unit test code>
-```
+Every `write_file` / `str_replace_in_file` call is tracked as a `modified_files` entry. After the loop, those files are read back and concatenated as `code_snippet` for the sandboxed executor.
 
-On retry, the coder also receives the tester's structured feedback and revises both outputs accordingly. Each LLM call in the coder loop is capped at **5000 output tokens** to control cost.
+On retry, the coder receives the tester's structured feedback. Because prior edits are already in the repo, it uses `str_replace_in_file` to fix specific problems rather than rewriting from scratch.
 
 ### Iterative Coder-Tester Loop
 
@@ -331,7 +332,7 @@ After each code generation:
 │   ├── llm_nodes.py               # LLM nodes: planner, coder, tester, test runner
 │   ├── context_nodes.py           # Repo validation, skills loading, context gen
 │   ├── planner_prompt.md          # Structured planning prompt (PLAN MODE)
-│   ├── coder_prompt.md            # Code + unit test generation prompt
+│   ├── coder_prompt.md            # ReAct coder prompt (explore → edit → output tests)
 │   └── tester_prompt.md           # Generic failure analysis prompt (APPROVED / NEEDS_WORK)
 ├── cache/
 │   ├── __init__.py                # Public API: get_cache()
@@ -343,7 +344,7 @@ After each code generation:
 │   ├── github.py                  # GitHub API integration
 │   ├── git_ops.py                 # Git CLI operations
 │   ├── ast_grep.py                # ast-grep CLI wrapper
-│   ├── langchain_tools.py         # LLM-callable tools
+│   ├── langchain_tools.py         # LLM-callable tools: search + file read/write/edit
 │   ├── storage.py                 # Redis + PostgreSQL abstraction
 │   ├── context_generator.py       # Project context generation
 │   └── context_compression.py     # Context compression strategies
