@@ -26,9 +26,13 @@ class Settings(BaseSettings):
     # ── Anthropic ──────────────────────────────────────────────────────────────
     anthropic_api_key: str
 
+    # ── GitHub OAuth App ──────────────────────────────────────────────────────
+    github_client: str = ""
+    github_secret: str = ""
+
     # ── GitHub — PAT or App (at least one must be set) ─────────────────────────
     github_token: str = ""
-    github_app_id: str = ""
+    github_app_id: str = "3770889"
     github_private_key_path: str = ""
     github_installation_id: int = 0
     github_webhook_secret: str = ""
@@ -55,13 +59,9 @@ class Settings(BaseSettings):
     # ── Flask ──────────────────────────────────────────────────────────────────
     flask_secret_key: SecretStr
 
-    # ── GitHub OAuth ───────────────────────────────────────────────────────────
-    github_oauth_client_id: str
-    github_oauth_client_secret: SecretStr
-
     # ── Google OAuth ───────────────────────────────────────────────────────────
-    google_oauth_client_id: str
-    google_oauth_client_secret: SecretStr
+    google_oauth_client_id: str = ""
+    google_oauth_client_secret: str = ""
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

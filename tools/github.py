@@ -22,8 +22,20 @@ def check_github_permissions() -> str | None:
 
     Returns an error string if permissions are insufficient, None if everything is OK.
     Used by the preflight node and test_tool.
+
+    Note: OAuth App client+secret credentials (GITHUB_CLIENT + GITHUB_SECRET) are verified
+    only for API connectivity — they cannot access private repos or create PRs unless the
+    repo is public.
     """
     s = get_settings()
+
+    if s.github_client and s.github_secret:
+        try:
+            Github(login_or_token=s.github_client, password=s.github_secret).get_rate_limit()
+        except Exception as exc:
+            return f"GitHub OAuth App credentials invalid: {exc}"
+        return None
+    
 
     if s.github_app_id and s.github_private_key_path:
         auth = _get_app_auth(s)
@@ -48,12 +60,13 @@ def check_github_permissions() -> str | None:
             )
         return None
 
-    return "No GitHub credentials configured. Set GITHUB_TOKEN or GITHUB_APP_ID."
+    return "No GitHub credentials configured. Set GITHUB_TOKEN, GITHUB_APP_ID, or GITHUB_CLIENT+GITHUB_SECRET."
 
 
 def _get_client() -> Github:
-    """Authenticates with GitHub using either GitHub App or Personal Access Token.
+    """Authenticates with GitHub using the first available credential set.
 
+    Priority: GitHub App > PAT > OAuth App client+secret.
     Raises EnvironmentError if no credentials are configured.
     """
     s = get_settings()
@@ -65,9 +78,12 @@ def _get_client() -> Github:
         log.info("Authenticating via Personal Access Token.")
         return Github(s.github_token)
 
+    if s.github_client and s.github_secret:
+        log.info("Authenticating via OAuth App client credentials.")
+        return Github(login_or_token=s.github_client, password=s.github_secret)
+
     raise EnvironmentError(
-        "No GitHub credentials found. Set GITHUB_TOKEN (PAT) or "
-        "GITHUB_APP_ID + GITHUB_PRIVATE_KEY_PATH + GITHUB_INSTALLATION_ID."
+        "No GitHub credentials found. Set GITHUB_TOKEN, GITHUB_APP_ID, or GITHUB_CLIENT+GITHUB_SECRET."
     )
 
 

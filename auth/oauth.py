@@ -42,7 +42,7 @@ def init_oauth(app) -> None:
     s = get_settings()
 
     _credentials: dict[str, tuple[str, str]] = {
-        "github": (s.github_oauth_client_id, s.github_oauth_client_secret.get_secret_value()),
+        "github": (s.github_client, s.github_secret),
         "google": (s.google_oauth_client_id, s.google_oauth_client_secret.get_secret_value()),
     }
 
