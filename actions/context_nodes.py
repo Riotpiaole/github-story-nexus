@@ -25,7 +25,6 @@ _SKILLS_PATTERN = re.compile(r'^(\w+):\s*["\']?([^"\'#\n]+?)["\']?\s*$')
 _IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
 _NOISE_TOKENS = re.compile(r'\b(__pycache__|\.pyc|\.DS_Store|Thumbs\.db)\b')
 
-_MISSING_README = "(no README found)"
 _MISSING_DEPENDENCY_MANIFEST = "(no dependency manifest found)"
 _MISSING_ENTRY_POINT = "(no entry point found)"
 
@@ -233,6 +232,8 @@ def _read_readme(repo_path: Path, issue_content: str) -> dict:
     LLM calls: 1
     Returns:
         {"readMeContent": "<summary>", "language": "<ast-grep language id>"}
+    Raises:
+        FileNotFoundError if no README exists in the repo root.
     """
     for name in ("README.md", "README.rst", "README.txt", "README"):
         candidate = repo_path / name
@@ -254,10 +255,7 @@ def _read_readme(repo_path: Path, issue_content: str) -> dict:
 
         try:
             log.info("Summarising README '%s' (%.1f KB)...", name, size / 1024)
-            prompt = _README_SUMMARIZE_PROMPT.format(
-                readme=raw,
-                issue_content=issue_content,
-            )
+            prompt = _README_SUMMARIZE_PROMPT.format(readme=raw, issue_content=issue_content)
             response = llm.invoke([HumanMessage(content=prompt)])
             parsed = json.loads(response.content.strip())
             log.info("Language inferred from README: %s", parsed.get("language"))
@@ -269,31 +267,31 @@ def _read_readme(repo_path: Path, issue_content: str) -> dict:
             log.warning("LLM failed to summarise README '%s': %s", name, e)
             return {"readMeContent": raw[:_README_FALLBACK_CHARS], "language": "python"}
 
-    return _MISSING_README
+    raise FileNotFoundError(
+        f"No README found in '{repo_path}'. "
+        "Add a README.md (or README.rst / README.txt) to the repository root so the agent "
+        "can summarise the project and infer the target language."
+    )
+
+
+def _read_first_found(repo_path: Path, candidates: list[str], max_lines: int, fallback: str) -> str:
+    """Return the first-found candidate file, capped at max_lines, or fallback."""
+    for name in candidates:
+        candidate = repo_path / name
+        if not candidate.exists():
+            continue
+        content = _read_text(candidate)
+        if content:
+            return f"### {name}\n" + "\n".join(content.splitlines()[:max_lines])
+    return fallback
 
 
 def _read_dependencies(repo_path: Path) -> str:
-    """Return the contents of the first dependency manifest found, capped at 80 lines."""
-    for name in _DEPENDENCY_FILES:
-        candidate = repo_path / name
-        if not candidate.exists():
-            continue
-        content = _read_text(candidate)
-        if content:
-            return f"### {name}\n" + "\n".join(content.splitlines()[:_DEPENDENCY_MAX_LINES])
-    return _MISSING_DEPENDENCY_MANIFEST
+    return _read_first_found(repo_path, _DEPENDENCY_FILES, _DEPENDENCY_MAX_LINES, _MISSING_DEPENDENCY_MANIFEST)
 
 
 def _read_entry_point(repo_path: Path) -> str:
-    """Return the first 60 lines of the project's main entry point file."""
-    for name in _ENTRY_POINTS:
-        candidate = repo_path / name
-        if not candidate.exists():
-            continue
-        content = _read_text(candidate)
-        if content:
-            return f"### {name}\n" + "\n".join(content.splitlines()[:_ENTRY_POINT_MAX_LINES])
-    return _MISSING_ENTRY_POINT
+    return _read_first_found(repo_path, _ENTRY_POINTS, _ENTRY_POINT_MAX_LINES, _MISSING_ENTRY_POINT)
 
 
 def _token_filter(lines: list[str]) -> list[str]:
@@ -345,17 +343,10 @@ def load_context(state: AgentState) -> dict:
     log.info("Issue fetched: %s", api_response["title"])
     
     # --- Gather README (+ language inference), dependencies, and entry point ---
-    readme = _read_readme(repo_path, issue_content)
-    if readme == _MISSING_README:
-        raise FileNotFoundError(
-            f"No README found in '{repo_path}'. "
-            "Add a README.md (or README.rst / README.txt) to the repository root so the agent "
-            "can summarise the project and infer the target language."
-        )
-    else:
-        language = readme["language"]
+    readme = _read_readme(repo_path, issue_content)  # raises FileNotFoundError if missing
+    language = readme["language"]
 
-        
+
     dependencies = _read_dependencies(repo_path)
     entry_point = _read_entry_point(repo_path)
 

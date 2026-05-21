@@ -11,6 +11,12 @@ log = logging.getLogger(__name__)
 _REQUIRED_PAT_SCOPES = {"repo", "public_repo"}
 
 
+def _get_app_auth(s):
+    """Returns a GitHub App installation access token object."""
+    private_key = Path(s.github_private_key_path).read_text()
+    return GithubIntegration(int(s.github_app_id), private_key).get_access_token(s.github_installation_id)
+
+
 def check_github_permissions() -> str | None:
     """Verifies the configured GitHub credentials have permission to push and create PRs.
 
@@ -20,9 +26,7 @@ def check_github_permissions() -> str | None:
     s = get_settings()
 
     if s.github_app_id and s.github_private_key_path:
-        private_key = Path(s.github_private_key_path).read_text()
-        integration = GithubIntegration(int(s.github_app_id), private_key)
-        auth = integration.get_access_token(s.github_installation_id)
+        auth = _get_app_auth(s)
         perms = getattr(auth, "permissions", {}) or {}
         pr_perm       = perms.get("pull_requests", "none") if isinstance(perms, dict) else getattr(perms, "pull_requests", "none")
         contents_perm = perms.get("contents", "none")      if isinstance(perms, dict) else getattr(perms, "contents", "none")
@@ -55,10 +59,7 @@ def _get_client() -> Github:
     s = get_settings()
     if s.github_app_id and s.github_private_key_path:
         log.info("Authenticating via GitHub App (app_id=%s)", s.github_app_id)
-        private_key = Path(s.github_private_key_path).read_text()
-        integration = GithubIntegration(int(s.github_app_id), private_key)
-        token = integration.get_access_token(s.github_installation_id).token
-        return Github(token)
+        return Github(_get_app_auth(s).token)
 
     if s.github_token:
         log.info("Authenticating via Personal Access Token.")

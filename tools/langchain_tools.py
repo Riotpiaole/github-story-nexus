@@ -10,6 +10,18 @@ from langchain_core.tools import tool
 from tools.ast_grep import search_functions, search_patterns
 
 
+def _format_results(result: dict, header: str) -> str:
+    if not result["success"]:
+        return f"Search failed: {result.get('error', 'Unknown error')}"
+    results = result.get("results", [])
+    if not results:
+        return f"No results for {header}"
+    lines = [f"Found {len(results)} result(s) for {header}:\n"]
+    for i, match in enumerate(results, 1):
+        lines.append(f"{i}. File: {match['file']} (line {match['line']})\n   Code: {match['text']}\n")
+    return "\n".join(lines)
+
+
 @tool
 def find_functions(pattern: str, repo_path: str) -> str:
     """Search for function definitions in the codebase by name or pattern.
@@ -24,17 +36,10 @@ def find_functions(pattern: str, repo_path: str) -> str:
     Returns:
         Formatted string with matching function definitions and their file locations
     """
-    result = search_functions(pattern, repo_path, language="python")
-    if not result["success"]:
-        return f"Search failed: {result.get('error', 'Unknown error')}"
-    results = result.get("results", [])
-    if not results:
-        return f"No functions matching '{pattern}' found in {repo_path}"
-    formatted = f"Found {len(results)} function(s) matching '{pattern}':\n\n"
-    for i, match in enumerate(results, 1):
-        formatted += f"{i}. File: {match['file']} (line {match['line']})\n"
-        formatted += f"   Code: {match['text']}\n\n"
-    return formatted
+    return _format_results(
+        search_functions(pattern, repo_path, language="python"),
+        f"functions matching '{pattern}' in {repo_path}",
+    )
 
 
 @tool
@@ -52,17 +57,10 @@ def search_code_patterns(pattern: str, repo_path: str, language: str = "python")
     Returns:
         Formatted string with matching code patterns and their file locations
     """
-    result = search_patterns(pattern, repo_path, language=language)
-    if not result["success"]:
-        return f"Search failed: {result.get('error', 'Unknown error')}"
-    results = result.get("results", [])
-    if not results:
-        return f"No matches found for pattern '{pattern}' in {repo_path}"
-    formatted = f"Found {len(results)} match(es) for pattern '{pattern}':\n\n"
-    for i, match in enumerate(results, 1):
-        formatted += f"{i}. File: {match['file']} (line {match['line']})\n"
-        formatted += f"   Code: {match['text']}\n\n"
-    return formatted
+    return _format_results(
+        search_patterns(pattern, repo_path, language=language),
+        f"pattern '{pattern}' in {repo_path}",
+    )
 
 
 @tool

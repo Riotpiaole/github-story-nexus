@@ -20,10 +20,25 @@ def _authenticated_remote_url(remote_url: str, token: str) -> str:
     return re.sub(r"https://([^@]*@)?", f"https://x-access-token:{token}@", remote_url)
 
 
+def _get_auth_url(local_repo_path: str) -> str:
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise EnvironmentError("GITHUB_TOKEN is not set.")
+    origin_url = _run(["git", "remote", "get-url", "origin"], cwd=local_repo_path)
+    return _authenticated_remote_url(origin_url, token)
+
+
 def _branch_exists_locally(local_repo_path: str, branch_name: str) -> bool:
     """Checks if a branch exists in the local repository."""
     result = _run(["git", "branch", "--list", branch_name], cwd=local_repo_path)
     return bool(result.strip())
+
+
+def _checkout_or_create_branch(local_repo_path: str, branch_name: str) -> None:
+    if _branch_exists_locally(local_repo_path, branch_name):
+        _run(["git", "checkout", branch_name], cwd=local_repo_path)
+    else:
+        _run(["git", "checkout", "-b", branch_name], cwd=local_repo_path)
 
 
 def push_empty_branch(local_repo_path: str, branch_name: str, base_branch: str) -> None:
@@ -32,22 +47,13 @@ def push_empty_branch(local_repo_path: str, branch_name: str, base_branch: str) 
     Used by the preflight node to verify push permissions before any real work begins.
     The branch is the same one that create_branch_and_commit will later populate.
     """
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise EnvironmentError("GITHUB_TOKEN is not set.")
-
-    origin_url = _run(["git", "remote", "get-url", "origin"], cwd=local_repo_path)
-    auth_url = _authenticated_remote_url(origin_url, token)
+    auth_url = _get_auth_url(local_repo_path)
 
     _run(["git", "fetch", auth_url, base_branch], cwd=local_repo_path)
     _run(["git", "checkout", base_branch], cwd=local_repo_path)
     _run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=local_repo_path)
 
-    if _branch_exists_locally(local_repo_path, branch_name):
-        _run(["git", "checkout", branch_name], cwd=local_repo_path)
-    else:
-        _run(["git", "checkout", "-b", branch_name], cwd=local_repo_path)
-
+    _checkout_or_create_branch(local_repo_path, branch_name)
     _run(
         ["git", "commit", "--allow-empty", "-m", "chore: preflight permission check"],
         cwd=local_repo_path,
@@ -73,12 +79,7 @@ def create_branch_and_commit(
         base_branch: Base branch to branch from (e.g. 'main').
         modified_files: Repo-relative paths written by the ReAct agent.
     """
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
-        raise EnvironmentError("GITHUB_TOKEN is not set.")
-
-    origin_url = _run(["git", "remote", "get-url", "origin"], cwd=local_repo_path)
-    auth_url = _authenticated_remote_url(origin_url, token)
+    auth_url = _get_auth_url(local_repo_path)
 
     log.info("Stashing agent edits before branch sync...")
     _run(["git", "stash", "--include-untracked"], cwd=local_repo_path)
@@ -88,12 +89,7 @@ def create_branch_and_commit(
     _run(["git", "checkout", base_branch], cwd=local_repo_path)
     _run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=local_repo_path)
 
-    if _branch_exists_locally(local_repo_path, branch_name):
-        log.info("Branch '%s' already exists locally — checking it out.", branch_name)
-        _run(["git", "checkout", branch_name], cwd=local_repo_path)
-    else:
-        log.info("Creating branch '%s'...", branch_name)
-        _run(["git", "checkout", "-b", branch_name], cwd=local_repo_path)
+    _checkout_or_create_branch(local_repo_path, branch_name)
 
     log.info("Restoring agent edits onto '%s'...", branch_name)
     _run(["git", "stash", "pop"], cwd=local_repo_path)

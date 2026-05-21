@@ -156,15 +156,6 @@ _bounded_llm = _CachedLLM(
 )
 
 
-def get_llm_with_tools():
-    """Returns LLM client with code search tools bound.
-
-    Used by llm_nodes for code generation with access to project structure.
-    """
-    tools = get_code_search_tools()
-    return llm.bind_tools(tools)
-
-
 def get_bounded_llm_with_tools():
     """Returns 5000-token-capped LLM with code search tools. Used by the coder."""
     return _bounded_llm.bind_tools(get_code_search_tools())

@@ -28,12 +28,10 @@ def preflight(state: AgentState) -> dict:
     """
     branch_name = f"fix/issue-{state['issue_number']}"
 
-    # ── 1. GitHub permission scope check ─────────────────────────────────────
     perm_error = check_github_permissions()
     if perm_error:
         return {"status": "preflight_failed", "preflight_error": f"GitHub permissions: {perm_error}"}
 
-    # ── 2. Push empty branch (confirms push access) ───────────────────────────
     try:
         push_empty_branch(state["local_repo_path"], branch_name, state["base_branch"])
     except Exception as exc:
@@ -42,7 +40,6 @@ def preflight(state: AgentState) -> dict:
             "preflight_error": f"GitHub push failed — check repo write access: {exc}",
         }
 
-    # ── 3. Create draft PR (confirms PR creation access) ─────────────────────
     try:
         pr_number = create_draft_pr(state["repo_name"], branch_name, state["base_branch"])
     except Exception as exc:
@@ -51,7 +48,6 @@ def preflight(state: AgentState) -> dict:
             "preflight_error": f"GitHub draft PR creation failed — check pull_requests permission: {exc}",
         }
 
-    # ── 4. ast-grep CLI ───────────────────────────────────────────────────────
     try:
         subprocess.run(
             ["ast-grep", "--version"],
