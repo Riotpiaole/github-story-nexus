@@ -269,7 +269,30 @@ invalidation is needed (e.g. append commit SHA for per-commit caching).
 - **Resilience**: Redis eviction or restart degrades to L2, never to a full recompute
 - **Failure isolation**: Any cache error is caught and logged; the agent falls through to a fresh compute rather than crashing
 
-### 5. Repository Validation
+### 5. Node Result Caching (plan + code)
+
+**Design**: `plan_solution` and `code_solution` each have their own two-level cache independent of the context cache.
+
+```
+L1: LocalCache (in-process LRU OrderedDict, bounded: 100 entries / 100 MB)
+         └── backed by a binary map file on disk for warm restarts
+
+L2: Redis (same Redis instance as context cache, no TTL — kept until evicted)
+```
+
+Cache keys:
+- `plan`: `node:plan:{user_id}:{repo_name}:{issue_number}`
+- `code`: `node:code:{user_id}:{repo_name}:{issue_number}:{retry_count}`
+
+On a `plan` cache hit: the LLM call is skipped; the cached `implementation_plan` is returned directly.
+
+On a `code` cache hit: the cached `modified_files`/`code_snippet`/`test_code` is returned **and** each file write is re-applied to the working tree, keeping the repo consistent even if the process recovered from a downstream failure mid-run.
+
+**LocalCache LRU eviction**: the in-process store is an `OrderedDict`. Every `get` moves the entry to the MRU end. Every `set` inserts at MRU, then evicts from the LRU end until both limits are satisfied.
+
+**Why**: Expensive ReAct-loop runs (potentially 10 × max_retries tool calls) should survive transient failures — Docker timeouts, network blips, process restarts — without forcing a full redo. The per-retry-count key ensures that on a real retry (tester feedback path) the coder re-runs fresh rather than replaying the stale result.
+
+### 6. Repository Validation
 
 **Design**: Before any PR operations, validate local repo matches remote.
 
@@ -284,7 +307,7 @@ def repo_validation(state):
 
 **Why**: Prevents accidental PR creation, ensures data consistency, protects repository integrity.
 
-### 6. Planning Before Coding
+### 7. Planning Before Coding
 
 **Design**: A dedicated `plan_solution` node runs before `code_solution` using a single plain LLM call (no tools).
 
@@ -302,7 +325,7 @@ issue_details + project_context
 
 **Why**: Separates reasoning from implementation. The planner uses the cached `project_context` as-is — no codebase re-exploration — keeping it cheap and fast. The coder receives a concrete plan rather than reasoning from scratch each iteration.
 
-### 7. ReAct Coder: In-Place File Editing
+### 8. ReAct Coder: In-Place File Editing
 
 **Design**: `code_solution` runs `_run_react_loop`, which gives Claude file read/write tools alongside the existing ast-grep search tools. The agent modifies existing repo files directly rather than generating a standalone snippet.
 
@@ -327,7 +350,7 @@ The agent's final response contains only `### TESTS`. The modified files are rea
 
 **Why**: Real code modifications match how engineers actually work — reading existing code, making surgical edits — rather than producing a context-free snippet that then has to be spliced in. It also handles multi-file changes naturally via the `modified_files` list.
 
-### 8. Stash-Based Branch Creation
+### 9. Stash-Based Branch Creation
 
 **Design**: Because the ReAct agent writes files directly to `local_repo_path` before `create_pr` runs, a naive `git reset --hard` would destroy those changes. `create_branch_and_commit` uses a stash round-trip:
 
@@ -342,7 +365,7 @@ git commit + push
 
 **Why**: Keeps the branch creation deterministic (always starts from a fresh `base_branch`) while preserving in-place edits the ReAct agent made to arbitrary paths in the working tree.
 
-### 9. Preflight: Permission Probe Before Token Spend
+### 10. Preflight: Permission Probe Before Token Spend
 
 **Design**: The first node pushes an empty branch and creates a draft PR to confirm end-to-end GitHub write access, then verifies `ast-grep` is on PATH. All four checks run before any LLM call.
 
@@ -370,7 +393,7 @@ python -m test_tool --verbose              # show tracebacks
 
 Exit code `0` = all configured checks passed; `1` = any failure.
 
-### 10. Tester as Failure Analyst with Early Termination
+### 11. Tester as Failure Analyst with Early Termination
 
 **Design**: On test failure, `tester_review` runs before any coder retry. It emits a structured verdict on the first line.
 
@@ -383,7 +406,7 @@ VERDICT: NEEDS_WORK → coder must fix; feedback follows below
 
 **Why**: Raw test output (assertion errors, tracebacks) is noisy. The tester translates it into actionable root-cause analysis targeting the specific issue — solution bugs vs. test bugs. The APPROVED path prevents unnecessary retries when the solution is already correct but the generated tests were flawed.
 
-### 11. Token Caps for Agent Cost Control
+### 12. Token Caps for Agent Cost Control
 
 **Design**: Two LLM instances in `config.py`.
 
@@ -475,16 +498,23 @@ The system supports multiple languages through:
 | Node | LLM instance | Max output tokens | Calls per run |
 |---|---|---|---|
 | `load_project_context` | `llm` (4096) | 4096 | 2 (cache miss) / 0 (hit) |
-| `plan_solution` | `llm` (4096) | 4096 | 1 |
-| `code_solution` (each ReAct iteration) | `_bounded_llm` (5000) | 5000 | 1–10 per attempt |
+| `plan_solution` | `llm` (4096) | 4096 | 1 (node cache miss) / 0 (hit) |
+| `code_solution` (each ReAct iteration) | `_bounded_llm` (5000) | 5000 | 1–10 per attempt (node cache miss) / 0 (hit) |
 | `tester_review` | `_bounded_llm` (5000) | 5000 | 1 per retry |
 
 Worst-case total output tokens: `2×4096 + 1×4096 + (4 attempts × 10 iterations × 5000) + (3 reviews × 5000)` = **~227K output tokens**. The dominant cost driver is the coder agentic loop; reducing `_MAX_LOOP_ITERATIONS` (default 10) is the highest-leverage knob.
 
 ### Caching Strategy
+
+**Context cache** (project summary — Redis → PostgreSQL):
 - **L1 Redis** — sub-millisecond retrieval, 60 s TTL auto-eviction
 - **L2 PostgreSQL** — persistent fallback, backfills L1 on miss
 - Cache keyed by `user_id + repo`; extend key scheme in `_make_context_key()` for finer invalidation
+
+**Node result cache** (plan + code — LocalCache → Redis):
+- **L1 LocalCache** — in-process LRU `OrderedDict` (100 entries / 100 MB); backed by a binary map file for warm restarts
+- **L2 Redis** — shared across processes; no TTL
+- Cache keyed by `node:plan:{user_id}:{repo}:{issue}` / `node:code:{user_id}:{repo}:{issue}:{retry}`
 
 ### Timeouts
 - Test execution: 60 seconds

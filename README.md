@@ -31,8 +31,8 @@ load_project_context ──(repo mismatch)────────────�
 1. **preflight** — Checks GitHub token scopes, pushes an empty `fix/issue-{N}` branch, creates a draft PR, and verifies `ast-grep` is on PATH. Any failure aborts immediately with a friendly message before any LLM work begins.
 2. **load_project_context** — Validates the repo, loads skills, and generates a compressed project summary (cached in Redis → PostgreSQL). Fails immediately if `--repo` does not match the remote origin.
 3. **read_issue** — Fetches issue title + body from GitHub
-4. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; no codebase re-exploration
-5. **code** — ReAct loop: Claude explores the repo with `list_directory`/`read_file`, locates targets with ast-grep search tools, then edits files in-place via `str_replace_in_file`/`write_file`; outputs only unit tests in its final response
+4. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; result cached (L1 local LRU + L2 Redis, 60 s TTL) so downstream failures don't force a redo
+5. **code** — ReAct loop: Claude explores the repo with `list_directory`/`read_file`, locates targets with ast-grep search tools, then edits files in-place via `str_replace_in_file`/`write_file`; outputs only unit tests in its final response; result cached per retry attempt — on a cache hit, file writes are re-applied to the working tree
 6. **test** — Runs solution + unit tests in an isolated Docker sandbox using the project's detected test runner
 7. **tester** — On failure: analyzes execution output and produces a structured verdict — `APPROVED` (solution is correct, early-terminate to PR) or `NEEDS_WORK` (feedback for the coder to iterate on)
 8. **create_pr** — Pushes real commits onto the preflight branch, then promotes the draft PR (updates title/body, clears draft flag)
@@ -287,6 +287,8 @@ This context is:
 
 Before writing any code, the agent runs a single LLM call against the cached `project_context` and the GitHub issue to produce a structured implementation plan (approach selection, affected components, ordered steps, risk assessment). The planner never re-explores the codebase — the cached context is sufficient.
 
+The plan result is cached (L1 in-memory LRU + L2 Redis, 60 s TTL) keyed by `user_id:repo_name:issue_number`. On a cache hit, the LLM call is skipped entirely, which prevents re-planning after a transient downstream failure.
+
 ### Code Generation with Skills
 
 The coder runs a **ReAct (Reason + Act)** loop — up to 10 tool iterations, 5000 output token cap — where it explores and edits the repository directly rather than generating a standalone snippet:
@@ -299,6 +301,8 @@ The coder runs a **ReAct (Reason + Act)** loop — up to 10 tool iterations, 500
 | Finish | Emits only `### TESTS <unit test code>` |
 
 Every `write_file` / `str_replace_in_file` call is tracked as a `modified_files` entry. After the loop, those files are read back and concatenated as `code_snippet` for the sandboxed executor.
+
+The code result is cached per retry attempt (L1 in-memory LRU + L2 Redis, 60 s TTL) keyed by `user_id:repo_name:issue_number:retry_count`. On a cache hit the file writes are re-applied to the working tree before returning, keeping the repo consistent even after a process crash.
 
 On retry, the coder receives the tester's structured feedback. Because prior edits are already in the repo, it uses `str_replace_in_file` to fix specific problems rather than rewriting from scratch.
 
@@ -318,10 +322,14 @@ After each code generation:
 |----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | — | **Required** Anthropic API key |
 | `GITHUB_TOKEN` | — | GitHub Personal Access Token (auth method A) |
-| `GITHUB_APP_ID` | — | GitHub App ID (auth method B) |
+| `GITHUB_APP_ID` | `3770889` | GitHub App ID (auth method B) |
 | `GITHUB_PRIVATE_KEY_PATH` | — | Path to GitHub App private key |
 | `GITHUB_INSTALLATION_ID` | — | GitHub App installation ID |
 | `GITHUB_WEBHOOK_SECRET` | — | HMAC secret for webhook requests |
+| `GITHUB_CLIENT` | — | GitHub OAuth App client ID (web UI login) |
+| `GITHUB_SECRET` | — | GitHub OAuth App client secret (web UI login) |
+| `GOOGLE_OAUTH_CLIENT_ID` | — | Google OAuth client ID (optional, web UI) |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | — | Google OAuth client secret (optional, web UI) |
 | `MAX_RETRIES` | `3` | Max full coder→tester iterations before giving up |
 | `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use for all LLM calls |
 | `BASE_BRANCH` | `main` | Default PR target branch |
