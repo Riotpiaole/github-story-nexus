@@ -2,12 +2,19 @@ import logging
 import os
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from tools.langchain_tools import get_code_search_tools
+
+from cache._llm import get_local_cache, make_cache_key
+from cache._llm import redis_get as _llm_redis_get
+from cache._llm import redis_set as _llm_redis_set
+
 
 # Explicitly load .env into os.environ before Settings is instantiated.
 # pydantic-settings also reads env_file directly, but calling load_dotenv()
@@ -90,16 +97,62 @@ log = logging.getLogger(__name__)
 
 _AGENT_MAX_TOKENS = 5000
 
-llm = ChatAnthropic(
-    model=settings.llm_model,
-    api_key=settings.anthropic_api_key,
-    max_tokens=4096,
+
+def _messages_to_str(messages: list) -> str:
+    return "\n---\n".join(
+        f"{getattr(m, 'type', type(m).__name__)}:{m.content if isinstance(m.content, str) else str(m.content)}"
+        for m in messages
+    )
+
+
+class _CachedLLM:
+    """Wraps a ChatAnthropic with L1 (LocalCache) + L2 (Redis, 60 s TTL) on invoke."""
+
+    def __init__(self, inner: ChatAnthropic, redis_url: str) -> None:
+        self._inner = inner
+        self._redis_url = redis_url
+        self._local = get_local_cache()
+
+    def invoke(self, messages: list, **kwargs: Any):
+        prompt_str = _messages_to_str(messages)
+        key, compressed = make_cache_key(prompt_str)
+
+        cached = self._local.get(key, compressed)
+        if cached is not None:
+            log.debug("LLM invoke L1 hit key=%s", key)
+            return AIMessage(content=cached)
+
+        cached = _llm_redis_get(self._redis_url, key, compressed)
+        if cached is not None:
+            log.debug("LLM invoke L2 hit key=%s — backfilling L1", key)
+            self._local.set(key, compressed, cached)
+            return AIMessage(content=cached)
+
+        result = self._inner.invoke(messages, **kwargs)
+        self._local.set(key, compressed, result.content)
+        _llm_redis_set(self._redis_url, key, compressed, result.content)
+        return result
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+llm = _CachedLLM(
+    ChatAnthropic(
+        model=settings.llm_model,
+        api_key=settings.anthropic_api_key,
+        max_tokens=4096,
+    ),
+    redis_url=settings.redis_url,
 )
 
-_bounded_llm = ChatAnthropic(
-    model=settings.llm_model,
-    api_key=settings.anthropic_api_key,
-    max_tokens=_AGENT_MAX_TOKENS,
+_bounded_llm = _CachedLLM(
+    ChatAnthropic(
+        model=settings.llm_model,
+        api_key=settings.anthropic_api_key,
+        max_tokens=_AGENT_MAX_TOKENS,
+    ),
+    redis_url=settings.redis_url,
 )
 
 
@@ -115,6 +168,12 @@ def get_llm_with_tools():
 def get_bounded_llm_with_tools():
     """Returns 5000-token-capped LLM with code search tools. Used by the coder."""
     return _bounded_llm.bind_tools(get_code_search_tools())
+
+
+def get_bounded_coder_llm_with_tools():
+    """Returns 5000-token-capped LLM with the full ReAct coder tool set (search + file ops)."""
+    from tools.langchain_tools import get_coder_tools
+    return _bounded_llm.bind_tools(get_coder_tools())
 
 
 def get_bounded_llm():

@@ -32,15 +32,13 @@ def create_pr(state: AgentState) -> dict:
     Returns the opened PR URL.
     """
     branch_name = f"fix/issue-{state['issue_number']}"
-    filename = f"solution_issue_{state['issue_number']}.py"
     log.info("Committing code and creating PR on branch '%s'...", branch_name)
 
     create_branch_and_commit(
         local_repo_path=state["local_repo_path"],
         branch_name=branch_name,
         base_branch=state["base_branch"],
-        code=state["code_snippet"],
-        filename=filename,
+        modified_files=state.get("modified_files", []),
     )
 
     pr_url = open_pull_request(

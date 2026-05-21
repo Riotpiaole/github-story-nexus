@@ -4,10 +4,10 @@ from pathlib import Path
 from langchain_core.messages import ToolMessage
 from langchain_core.prompts import ChatPromptTemplate
 
-from config import get_bounded_llm, get_bounded_llm_with_tools, llm, settings
+from config import get_bounded_coder_llm_with_tools, get_bounded_llm, llm, settings
 from state import AgentState
 from tools.executor import execute_tests
-from tools.langchain_tools import get_code_search_tools
+from tools.langchain_tools import get_coder_tools
 
 log = logging.getLogger(__name__)
 
@@ -46,45 +46,53 @@ _TESTER_PROMPT = ChatPromptTemplate.from_messages([
 ])
 
 
-def _run_agentic_loop(
+_FILE_WRITE_TOOLS = {"write_file", "str_replace_in_file"}
+
+
+def _run_react_loop(
     prompt: ChatPromptTemplate,
     variables: dict,
     repo_path: str,
-) -> str:
-    """Runs an agentic LLM loop with codebase search tools.
+) -> tuple[list[str], str]:
+    """Runs a ReAct LLM loop: the agent reads/edits repo files directly via tools.
 
-    Iterates up to _MAX_LOOP_ITERATIONS, executing any tool calls the LLM makes,
-    then returns the final text response.
+    Tracks which files are written or modified during the loop. When the agent
+    makes no further tool calls its final message must contain ### TESTS.
+
+    Returns:
+        (modified_files, test_code) — repo-relative paths that were written,
+        and the unit test code extracted from the agent's final response.
     """
-    llm_with_tools = get_bounded_llm_with_tools()
-    tools = {t.name: t for t in get_code_search_tools()}
+    llm_with_tools = get_bounded_coder_llm_with_tools()
+    tools = {t.name: t for t in get_coder_tools()}
     messages = prompt.format_messages(**variables)
+    modified_files: list[str] = []
 
     for iteration in range(_MAX_LOOP_ITERATIONS):
         response = llm_with_tools.invoke(messages)
         messages.append(response)
 
         if not response.tool_calls:
-            return response.content
+            _, _, rest = response.content.partition("### TESTS")
+            return modified_files, rest.strip()
 
-        log.info("Loop iteration %d: executing %d tool call(s).", iteration + 1, len(response.tool_calls))
+        log.info("ReAct iteration %d: executing %d tool call(s).", iteration + 1, len(response.tool_calls))
         for call in response.tool_calls:
             fn = tools.get(call["name"])
             result = fn.invoke({**call["args"], "repo_path": repo_path}) if fn else f"Unknown tool: {call['name']}"
             messages.append(ToolMessage(content=str(result), tool_call_id=call["id"]))
 
-    log.warning("Agentic loop reached max iterations (%d).", _MAX_LOOP_ITERATIONS)
+            if call["name"] in _FILE_WRITE_TOOLS:
+                path = call["args"].get("path", "")
+                if path and path not in modified_files:
+                    modified_files.append(path)
+
+    log.warning("ReAct loop reached max iterations (%d).", _MAX_LOOP_ITERATIONS)
     for msg in reversed(messages):
         if hasattr(msg, "content") and isinstance(msg.content, str) and msg.content:
-            return msg.content
-    return ""
-
-
-def _parse_coder_output(raw: str) -> tuple[str, str]:
-    """Splits the coder's two-section output into (solution_code, test_code)."""
-    solution, _, rest = raw.partition("### TESTS")
-    solution = solution.replace("### SOLUTION", "").strip()
-    return solution, rest.strip()
+            _, _, rest = msg.content.partition("### TESTS")
+            return modified_files, rest.strip()
+    return modified_files, ""
 
 
 def _parse_tester_verdict(raw: str) -> str:
@@ -110,13 +118,15 @@ def plan_solution(state: AgentState) -> dict:
 
 
 def code_solution(state: AgentState) -> dict:
-    """Generates solution code and unit tests using an agentic loop.
+    """Modifies repo files in-place via a ReAct loop and returns unit test code.
 
-    On retry, receives structured tester feedback to guide revision of both
-    the solution and the tests.
+    The agent reads existing files, applies targeted edits, then emits only
+    ### TESTS in its final response. Modified file contents are concatenated
+    into code_snippet for the sandboxed executor.
     """
     log.info("Generating solution (attempt %d/%d)...", state["retry_count"] + 1, settings.max_retries)
-    raw = _run_agentic_loop(
+    repo_path = Path(state["local_repo_path"])
+    modified_files, test_code = _run_react_loop(
         _CODE_PROMPT,
         {
             "plan": state.get("implementation_plan", ""),
@@ -124,10 +134,14 @@ def code_solution(state: AgentState) -> dict:
             "context": state["project_context"],
             "tester_feedback": state.get("tester_feedback") or "None — first attempt.",
         },
-        state["local_repo_path"],
+        str(repo_path),
     )
-    solution, tests = _parse_coder_output(raw)
-    return {"code_snippet": solution, "test_code": tests}
+    code_snippet = "\n\n".join(
+        f"# --- {f} ---\n{(repo_path / f).read_text()}"
+        for f in modified_files
+        if (repo_path / f).exists()
+    )
+    return {"modified_files": modified_files, "code_snippet": code_snippet, "test_code": test_code}
 
 
 def test_code(state: AgentState) -> dict:

@@ -11,8 +11,9 @@ class AgentState(TypedDict):
     project_context: str      # compressed file tree + function index (cached)
     issue_details: str
     implementation_plan: str  # structured plan produced by plan_solution
-    code_snippet: str
-    test_code: str            # unit tests written by the coder
+    modified_files: list[str]  # repo-relative paths written by the ReAct coder
+    code_snippet: str          # concatenated content of modified_files (for the sandbox executor)
+    test_code: str             # unit tests written by the coder
     test_results: str         # raw execution output
     tester_feedback: str      # structured failure analysis from tester_review
     retry_count: int
