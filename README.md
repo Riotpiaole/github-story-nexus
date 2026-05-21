@@ -7,11 +7,14 @@ A **generic issue-to-PR generator** that automatically reads GitHub issues, gene
 This tool transforms GitHub issues into complete pull requests through an intelligent, project-aware workflow:
 
 ```
+preflight ──(fail)──────────────────────────────────────────────────► fail_state
+        │
+        ▼
 load_project_context ──(repo mismatch)──────────────────────────────► fail_state
         │
         ▼
    read_issue → plan → code → test ──(pass)──────────────────────► create_pr
-                         ▲     │
+                         ▲     │                                  (promotes draft PR)
                          │     └──(fail)──► tester ──(APPROVED)──► create_pr
                          │                    │
                          └──(NEEDS_WORK, retry remaining)
@@ -21,17 +24,18 @@ load_project_context ──(repo mismatch)────────────�
                                           fail_state
 ```
 
-`load_project_context` bundles repo validation, skills loading, and context generation. If the `--repo` flag does not match the remote origin, the workflow routes immediately to `fail_state` without proceeding further.
+`preflight` runs before any LLM or context work. It verifies GitHub permissions and `ast-grep` availability, pushes an empty branch, and creates a draft PR — confirming end-to-end access before spending tokens. `create_pr` later promotes that draft to a ready PR.
 
 ### Workflow Stages
 
-1. **load_project_context** — Validates the repo, loads skills, and generates a compressed project summary (cached in Redis → PostgreSQL). Fails immediately if `--repo` does not match the remote origin.
-2. **read_issue** — Fetches issue title + body from GitHub
-3. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; no codebase re-exploration
-4. **code** — ReAct loop: Claude explores the repo with `list_directory`/`read_file`, locates targets with ast-grep search tools, then edits files in-place via `str_replace_in_file`/`write_file`; outputs only unit tests in its final response
-5. **test** — Runs solution + unit tests in an isolated Docker sandbox using the project's detected test runner
-6. **tester** — On failure: analyzes execution output and produces a structured verdict — `APPROVED` (solution is correct, early-terminate to PR) or `NEEDS_WORK` (feedback for the coder to iterate on)
-7. **create_pr** — Creates branch, commits, pushes, opens PR
+1. **preflight** — Checks GitHub token scopes, pushes an empty `fix/issue-{N}` branch, creates a draft PR, and verifies `ast-grep` is on PATH. Any failure aborts immediately with a friendly message before any LLM work begins.
+2. **load_project_context** — Validates the repo, loads skills, and generates a compressed project summary (cached in Redis → PostgreSQL). Fails immediately if `--repo` does not match the remote origin.
+3. **read_issue** — Fetches issue title + body from GitHub
+4. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; no codebase re-exploration
+5. **code** — ReAct loop: Claude explores the repo with `list_directory`/`read_file`, locates targets with ast-grep search tools, then edits files in-place via `str_replace_in_file`/`write_file`; outputs only unit tests in its final response
+6. **test** — Runs solution + unit tests in an isolated Docker sandbox using the project's detected test runner
+7. **tester** — On failure: analyzes execution output and produces a structured verdict — `APPROVED` (solution is correct, early-terminate to PR) or `NEEDS_WORK` (feedback for the coder to iterate on)
+8. **create_pr** — Pushes real commits onto the preflight branch, then promotes the draft PR (updates title/body, clears draft flag)
 
 ## Quick Start
 
@@ -230,6 +234,19 @@ Trigger by labeling an issue with `generate-pr`
 
 ## How It Works
 
+### Preflight Checks
+
+Before any LLM call or context work, the agent runs a preflight node that:
+
+1. **GitHub scope check** — verifies the configured PAT has `repo`/`public_repo` scope, or the GitHub App has `pull_requests: write` and `contents: write`
+2. **Push probe** — pushes an empty commit to `fix/issue-{N}` to confirm write access to the target repo
+3. **Draft PR probe** — creates a draft PR on that branch to confirm PR creation access
+4. **ast-grep** — confirms `ast-grep` is on PATH
+
+If any step fails the graph routes immediately to `fail_state` and prints a human-readable error. No tokens are spent.
+
+On success, `create_pr` promotes the draft PR (updates title/body, clears draft flag) rather than opening a new one.
+
 ### Repo Validation
 
 Before processing, the agent validates:
@@ -348,6 +365,17 @@ After each code generation:
 │   ├── storage.py                 # Redis + PostgreSQL abstraction
 │   ├── context_generator.py       # Project context generation
 │   └── context_compression.py     # Context compression strategies
+├── test_tool/
+│   ├── __main__.py                # CLI entry point (python -m test_tool)
+│   ├── runner.py                  # Parallel check runner + result formatter
+│   └── checks/
+│       ├── github.py              # GitHub auth + PR scope check
+│       ├── redis.py               # Redis PING
+│       ├── postgres.py            # PostgreSQL SELECT 1
+│       ├── mongodb.py             # MongoDB ping
+│       ├── docker.py              # Docker daemon + image presence
+│       ├── ast_grep.py            # ast-grep --version
+│       └── node.py                # node/npx --version
 └── README.md                       # This file
 ```
 
@@ -402,6 +430,19 @@ python main.py --repo myorg/api --issue 456 --path /path/to/api
 # - Integration into existing routes
 # - PR ready to merge
 ```
+
+## Pre-run Connectivity Check
+
+Before running the agent, verify all external service connections:
+
+```bash
+python -m test_tool                        # check all services
+python -m test_tool --only github,ast_grep # check specific services
+python -m test_tool --list                 # list available checks
+python -m test_tool --verbose              # show full tracebacks on failure
+```
+
+Note: the preflight node inside the graph runs the GitHub and ast-grep checks automatically on every run. `test_tool` is for manual validation and CI gating before invoking the agent.
 
 ## Troubleshooting
 

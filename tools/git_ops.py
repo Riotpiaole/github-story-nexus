@@ -26,6 +26,36 @@ def _branch_exists_locally(local_repo_path: str, branch_name: str) -> bool:
     return bool(result.strip())
 
 
+def push_empty_branch(local_repo_path: str, branch_name: str, base_branch: str) -> None:
+    """Creates a branch with an empty commit and pushes it to origin.
+
+    Used by the preflight node to verify push permissions before any real work begins.
+    The branch is the same one that create_branch_and_commit will later populate.
+    """
+    token = os.getenv("GITHUB_TOKEN")
+    if not token:
+        raise EnvironmentError("GITHUB_TOKEN is not set.")
+
+    origin_url = _run(["git", "remote", "get-url", "origin"], cwd=local_repo_path)
+    auth_url = _authenticated_remote_url(origin_url, token)
+
+    _run(["git", "fetch", auth_url, base_branch], cwd=local_repo_path)
+    _run(["git", "checkout", base_branch], cwd=local_repo_path)
+    _run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=local_repo_path)
+
+    if _branch_exists_locally(local_repo_path, branch_name):
+        _run(["git", "checkout", branch_name], cwd=local_repo_path)
+    else:
+        _run(["git", "checkout", "-b", branch_name], cwd=local_repo_path)
+
+    _run(
+        ["git", "commit", "--allow-empty", "-m", "chore: preflight permission check"],
+        cwd=local_repo_path,
+    )
+    _run(["git", "push", "-u", auth_url, branch_name], cwd=local_repo_path)
+    log.info("Preflight branch '%s' pushed to origin.", branch_name)
+
+
 def create_branch_and_commit(
     local_repo_path: str,
     branch_name: str,

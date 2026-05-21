@@ -1,8 +1,8 @@
 from langgraph.graph import StateGraph, START, END
 
-from state import AgentState, route_after_context, route_after_test, route_after_tester
+from state import AgentState, route_after_preflight, route_after_context, route_after_test, route_after_tester
 from actions.context_nodes import load_project_context
-from actions.git_nodes import read_github_issue, create_pr, handle_failure
+from actions.git_nodes import preflight, read_github_issue, create_pr, handle_failure
 from actions.llm_nodes import plan_solution, code_solution, test_code, tester_review
 
 
@@ -10,10 +10,13 @@ def build_graph():
     """Builds and compiles the LangGraph state machine.
 
     Workflow:
-      load_project_context → read_issue → plan → code → test → (conditional routing)
+      preflight → load_project_context → read_issue → plan → code → test → (conditional routing)
+
+    preflight checks GitHub permissions (token scopes, push, draft PR) and ast-grep.
+    Any preflight failure routes immediately to fail_state before any LLM work begins.
 
     On test success:
-      test → create_pr → END
+      test → create_pr (promotes draft PR) → END
 
     On test failure:
       test → tester (analyzes failure, produces feedback or APPROVED verdict)
@@ -25,6 +28,7 @@ def build_graph():
     """
     workflow = StateGraph(AgentState)
 
+    workflow.add_node("preflight", preflight)
     workflow.add_node("load_project_context", load_project_context)
     workflow.add_node("read_issue", read_github_issue)
     workflow.add_node("plan", plan_solution)
@@ -34,7 +38,12 @@ def build_graph():
     workflow.add_node("create_pr", create_pr)
     workflow.add_node("fail_state", handle_failure)
 
-    workflow.add_edge(START, "load_project_context")
+    workflow.add_edge(START, "preflight")
+    workflow.add_conditional_edges(
+        "preflight",
+        route_after_preflight,
+        {"load_project_context": "load_project_context", "fail_state": "fail_state"},
+    )
     workflow.add_conditional_edges(
         "load_project_context",
         route_after_context,

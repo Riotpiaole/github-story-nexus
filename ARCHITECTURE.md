@@ -30,9 +30,10 @@ This document describes the design and architecture of story-pr-agent.
 │  └──────────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │  Git Nodes (actions/git_nodes.py)                        │   │
+│  │  - preflight: GitHub scope + push + draft PR + ast-grep  │   │
 │  │  - read_github_issue: Fetch from GitHub API              │   │
-│  │  - create_pr: Create branch, commit, push, open PR       │   │
-│  │  - handle_failure: Log and finalize on max retries       │   │
+│  │  - create_pr: Push real code, promote draft PR           │   │
+│  │  - handle_failure: Log and finalize on all failure paths │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │  ┌──────────────────────────────────────────────────────────┐   │
 │  │  LLM Nodes (actions/llm_nodes.py)                        │   │
@@ -82,6 +83,16 @@ The graph passes state through nodes in sequence:
 
 ```
 START
+  │
+  ├─► preflight
+  │   ├─ Check: GitHub token scopes (PAT: repo/public_repo | App: pull_requests+contents write)
+  │   ├─ Push: empty commit to fix/issue-{N} → confirms push access
+  │   ├─ Create: draft PR on that branch → confirms PR creation access
+  │   ├─ Check: ast-grep --version → confirms CLI on PATH
+  │   ├─ If any fail:
+  │   │   └─ Return: {status: "preflight_failed", preflight_error: "<message>"}
+  │   │   └─ [route_after_preflight → fail_state]  ← no tokens spent
+  │   └─ Return: {preflight_pr_number: <pr_number>}
   │
   ├─► repo_validation
   │   ├─ Read: repo_name, local_repo_path
@@ -157,11 +168,11 @@ START
   ├─► create_pr (on success or tester APPROVED)
   │   ├─ Stash: agent's in-place edits
   │   ├─ Fetch + reset: sync base_branch from origin
-  │   ├─ Create: New branch (fix/issue-N)
+  │   ├─ Checkout: fix/issue-N (already exists from preflight)
   │   ├─ Pop stash: restore agent edits onto feature branch
   │   ├─ Stage: all paths in modified_files
-  │   ├─ Commit + Push: to origin
-  │   ├─ Open: Pull request
+  │   ├─ Commit + Push: real solution onto the preflight branch
+  │   ├─ Promote: update_pull_request(preflight_pr_number) → title/body + draft=False
   │   └─ Return: {status: "pr_created", pr_url: ...}
   │
   ├─► handle_failure (on max iterations exceeded)
@@ -331,7 +342,35 @@ git commit + push
 
 **Why**: Keeps the branch creation deterministic (always starts from a fresh `base_branch`) while preserving in-place edits the ReAct agent made to arbitrary paths in the working tree.
 
-### 9. Tester as Failure Analyst with Early Termination
+### 9. Preflight: Permission Probe Before Token Spend
+
+**Design**: The first node pushes an empty branch and creates a draft PR to confirm end-to-end GitHub write access, then verifies `ast-grep` is on PATH. All four checks run before any LLM call.
+
+```
+preflight_check
+  1. check_github_permissions()   ← token scopes / App permissions
+  2. push_empty_branch()          ← confirms push access to origin
+  3. create_draft_pr()            ← confirms PR creation access; stores pr_number
+  4. ast-grep --version           ← confirms code search CLI available
+```
+
+On any failure: `status = "preflight_failed"`, `preflight_error = "<message>"` → `fail_state` immediately.
+
+On success: `preflight_pr_number` is stored in state. `create_pr` calls `update_pull_request(pr_number)` to promote the draft (update title/body, set `draft=False`) rather than opening a new PR.
+
+**Why**: Expensive LLM work (context generation, planning, ReAct loop) should never start if the agent can't deliver its output. A permission failure discovered after a 2-minute coder loop is far more costly than a 3-second preflight probe.
+
+**`test_tool/`** — standalone CLI for manual pre-run validation and CI gating. Runs the same GitHub and ast-grep checks (plus Redis, PostgreSQL, MongoDB, Docker) in parallel outside the graph:
+
+```bash
+python -m test_tool                        # all checks
+python -m test_tool --only github,ast_grep # subset
+python -m test_tool --verbose              # show tracebacks
+```
+
+Exit code `0` = all configured checks passed; `1` = any failure.
+
+### 10. Tester as Failure Analyst with Early Termination
 
 **Design**: On test failure, `tester_review` runs before any coder retry. It emits a structured verdict on the first line.
 
@@ -344,7 +383,7 @@ VERDICT: NEEDS_WORK → coder must fix; feedback follows below
 
 **Why**: Raw test output (assertion errors, tracebacks) is noisy. The tester translates it into actionable root-cause analysis targeting the specific issue — solution bugs vs. test bugs. The APPROVED path prevents unnecessary retries when the solution is already correct but the generated tests were flawed.
 
-### 10. Token Caps for Agent Cost Control
+### 11. Token Caps for Agent Cost Control
 
 **Design**: Two LLM instances in `config.py`.
 
@@ -377,6 +416,10 @@ class AgentState(TypedDict):
     # Planning
     implementation_plan: str  # structured plan from plan_solution
 
+    # Preflight
+    preflight_pr_number: int  # draft PR number created by preflight; promoted by create_pr
+    preflight_error: str      # human-readable failure reason (set when preflight fails)
+
     # Generated (ReAct coder edits files in-place)
     modified_files: list[str] # repo-relative paths written by the ReAct coder
     code_snippet: str         # concatenated content of modified_files (for sandbox executor)
@@ -396,13 +439,15 @@ class AgentState(TypedDict):
 ### Status Transitions
 
 ```
+preflight (fail)  → status = "preflight_failed" → route_after_preflight → fail_state (no tokens spent)
+preflight (ok)    → (no status set, preflight_pr_number stored)
 read_issue        → (no status set)
-test_code (pass)  → status = "success"        → route_after_test → create_pr
-test_code (fail)  → status = "retry"          → route_after_test → tester_review
-tester_review     → status = "tester_approved" → route_after_tester → create_pr  (early exit)
+test_code (pass)  → status = "success"           → route_after_test → create_pr
+test_code (fail)  → status = "retry"             → route_after_test → tester_review
+tester_review     → status = "tester_approved"   → route_after_tester → create_pr  (early exit)
                    (NEEDS_WORK, no status change) → route_after_tester → code or fail_state
 handle_failure    → status = "failed"
-create_pr         → status = "pr_created"
+create_pr         → status = "pr_created"        (promotes preflight draft PR)
 ```
 
 ## Language Support Strategy
