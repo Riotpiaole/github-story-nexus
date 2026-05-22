@@ -15,17 +15,17 @@ def _run(cmd: list[str], cwd: str) -> str:
     return result.stdout.strip()
 
 
-def _authenticated_remote_url(remote_url: str, token: str) -> str:
+def _authenticated_remote_url(remote_url: str) -> str:
     """Injects GitHub token into HTTPS remote URL for passwordless authentication."""
+    token = os.getenv("GITHUB_TOKEN")
     return re.sub(r"https://([^@]*@)?", f"https://x-access-token:{token}@", remote_url)
 
 
 def _get_auth_url(local_repo_path: str) -> str:
-    token = os.getenv("GITHUB_TOKEN")
-    if not token:
+    if not os.getenv("GITHUB_TOKEN"):
         raise EnvironmentError("GITHUB_TOKEN is not set.")
     origin_url = _run(["git", "remote", "get-url", "origin"], cwd=local_repo_path)
-    return _authenticated_remote_url(origin_url, token)
+    return _authenticated_remote_url(origin_url)
 
 
 def _branch_exists_locally(local_repo_path: str, branch_name: str) -> bool:
@@ -41,25 +41,18 @@ def _checkout_or_create_branch(local_repo_path: str, branch_name: str) -> None:
         _run(["git", "checkout", "-b", branch_name], cwd=local_repo_path)
 
 
-def push_empty_branch(local_repo_path: str, branch_name: str, base_branch: str) -> None:
-    """Creates a branch with an empty commit and pushes it to origin.
+def ensure_repo_cloned(remote_repo_git: str, local_repo_path: str) -> None:
+    """Clones remote_repo_git to local_repo_path if the directory is missing or not a git repo.
 
-    Used by the preflight node to verify push permissions before any real work begins.
-    The branch is the same one that create_branch_and_commit will later populate.
+    No-op if the repo is already present.
     """
-    auth_url = _get_auth_url(local_repo_path)
-
-    _run(["git", "fetch", auth_url, base_branch], cwd=local_repo_path)
-    _run(["git", "checkout", base_branch], cwd=local_repo_path)
-    _run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=local_repo_path)
-
-    _checkout_or_create_branch(local_repo_path, branch_name)
-    _run(
-        ["git", "commit", "--allow-empty", "-m", "chore: preflight permission check"],
-        cwd=local_repo_path,
-    )
-    _run(["git", "push", "-u", auth_url, branch_name], cwd=local_repo_path)
-    log.info("Preflight branch '%s' pushed to origin.", branch_name)
+    repo_path = Path(local_repo_path)
+    if not repo_path.exists() or not (repo_path / ".git").exists():
+        log.info("Local path '%s' missing — cloning from remote...", local_repo_path)
+        repo_path.parent.mkdir(parents=True, exist_ok=True)
+        remote_url = _authenticated_remote_url(f"https://github.com/{remote_repo_git}")
+        _run(["git", "clone", remote_url, local_repo_path], cwd=str(repo_path.parent))
+        log.info("Cloned '%s' to '%s'.", remote_repo_git, local_repo_path)
 
 
 def create_branch_and_commit(

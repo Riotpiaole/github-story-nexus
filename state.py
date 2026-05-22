@@ -7,7 +7,6 @@ class AgentState(TypedDict):
     issue_number: int
     local_repo_path: str      # path to local clone of the repo
     base_branch: str          # e.g. "main"
-    preflight_pr_number: int  # draft PR number created during preflight; promoted in create_pr
     preflight_error: str      # human-readable failure reason set when preflight fails
     skills: dict              # parsed from skills.sh (language, framework, test_runner, ...)
     project_context: str      # compressed file tree + function index (cached)
@@ -22,6 +21,7 @@ class AgentState(TypedDict):
     max_retries: int
     status: str
     pr_url: str
+    github_token: str
 
 
 def route_after_preflight(state: AgentState) -> Literal["load_project_context", "fail_state"]:

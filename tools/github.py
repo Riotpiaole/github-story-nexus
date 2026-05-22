@@ -1,4 +1,7 @@
 import logging
+import requests
+import time
+from os import environ
 from pathlib import Path
 
 from github import Github, GithubIntegration, GithubException
@@ -6,12 +9,19 @@ from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_excep
 
 from config import get_settings
 
+
 log = logging.getLogger(__name__)
 
-_REQUIRED_PAT_SCOPES = {"repo", "public_repo"}
+_REQUIRED_PAT_SCOPES = {"repo"}
 
 
-def _get_app_auth(s):
+
+_transient = retry_if_exception_type(GithubException)
+_backoff = wait_exponential(multiplier=1, min=2, max=30)
+
+
+
+def _get_githubApp_auth_token(s):
     """Returns a GitHub App installation access token object."""
     private_key = Path(s.github_private_key_path).read_text()
     return GithubIntegration(int(s.github_app_id), private_key).get_access_token(s.github_installation_id)
@@ -29,16 +39,17 @@ def check_github_permissions() -> str | None:
     """
     s = get_settings()
 
+    # github oauth app authentication
     if s.github_client and s.github_secret:
         try:
-            Github(login_or_token=s.github_client, password=s.github_secret).get_rate_limit()
+            get_github_auth_token(s.github_client)
         except Exception as exc:
             return f"GitHub OAuth App credentials invalid: {exc}"
         return None
-    
 
+    # githubApp InstalltionId authentication
     if s.github_app_id and s.github_private_key_path:
-        auth = _get_app_auth(s)
+        auth = _get_githubApp_auth_token(s)
         perms = getattr(auth, "permissions", {}) or {}
         pr_perm       = perms.get("pull_requests", "none") if isinstance(perms, dict) else getattr(perms, "pull_requests", "none")
         contents_perm = perms.get("contents", "none")      if isinstance(perms, dict) else getattr(perms, "contents", "none")
@@ -47,7 +58,12 @@ def check_github_permissions() -> str | None:
             issues.append(f"pull_requests={pr_perm!r} (need 'write')")
         if contents_perm not in ("write", "admin"):
             issues.append(f"contents={contents_perm!r} (need 'write')")
-        return f"GitHub App missing permissions: {', '.join(issues)}" if issues else None
+
+        if issues:
+            return f"GitHub App missing permissions: {', '.join(issues)}"
+        
+        environ["GITHUB_TOKEN"] = auth.token
+        return None
 
     if s.github_token:
         g = Github(s.github_token)
@@ -66,29 +82,25 @@ def check_github_permissions() -> str | None:
 def _get_client() -> Github:
     """Authenticates with GitHub using the first available credential set.
 
-    Priority: GitHub App > PAT > OAuth App client+secret.
+    Priority: GitHub App > PAT > OAuth device flow.
     Raises EnvironmentError if no credentials are configured.
     """
     s = get_settings()
     if s.github_app_id and s.github_private_key_path:
         log.info("Authenticating via GitHub App (app_id=%s)", s.github_app_id)
-        return Github(_get_app_auth(s).token)
+        return Github(_get_githubApp_auth_token(s).token)
 
     if s.github_token:
         log.info("Authenticating via Personal Access Token.")
         return Github(s.github_token)
 
-    if s.github_client and s.github_secret:
-        log.info("Authenticating via OAuth App client credentials.")
-        return Github(login_or_token=s.github_client, password=s.github_secret)
+    if s.github_client:
+        log.info("Authenticating via OAuth device flow.")
+        return Github(get_github_auth_token(s.github_client))
 
     raise EnvironmentError(
-        "No GitHub credentials found. Set GITHUB_TOKEN, GITHUB_APP_ID, or GITHUB_CLIENT+GITHUB_SECRET."
+        "No GitHub credentials found. Set GITHUB_TOKEN, GITHUB_APP_ID, or GITHUB_CLIENT."
     )
-
-
-_transient = retry_if_exception_type(GithubException)
-_backoff = wait_exponential(multiplier=1, min=2, max=30)
 
 
 @retry(retry=_transient, stop=stop_after_attempt(3), wait=_backoff, reraise=True)
@@ -141,31 +153,57 @@ def open_pull_request(repo_name: str, branch_name: str, base_branch: str, title:
     return pr.html_url
 
 
-def create_draft_pr(repo_name: str, branch_name: str, base_branch: str) -> int:
-    """Creates a draft placeholder PR for the preflight check.
 
-    Returns the PR number so create_pr can later promote it to a real PR.
+
+def get_github_auth_token(client_id: str) -> str:
+    """Returns a GitHub access token via the device OAuth flow.
+
+    Returns the cached GITHUB_TOKEN env var if set (and not the '#' re-auth sentinel).
+    Otherwise initiates the GitHub device flow, polls until the user approves, then
+    caches the resulting token in GITHUB_TOKEN for subsequent calls.
     """
-    g = _get_client()
-    repo = g.get_repo(repo_name)
-    pr = repo.create_pull(
-        title="[preflight] permission check",
-        body="Automated preflight — will be replaced with the real implementation.",
-        head=branch_name,
-        base=base_branch,
-        draft=True,
+    token = environ.get("GITHUB_TOKEN")
+    if token and token != "#":
+        return token
+
+    device_code_resp = requests.post(
+        "https://github.com/login/device/code",
+        headers={"Accept": "application/json"},
+        json={"client_id": client_id, "scope": " ".join(_REQUIRED_PAT_SCOPES)},
     )
-    log.info("Draft preflight PR #%d created: %s", pr.number, pr.html_url)
-    return pr.number
+    device_code_resp.raise_for_status()
+    data = device_code_resp.json()
+
+    print(f"\nOpen {data['verification_uri']} and enter code: {data['user_code']}\n")
+
+    token = _poll_for_oauth_token(data["device_code"], data["interval"], client_id)
+    environ["GITHUB_TOKEN"] = token
+    return token
 
 
-def update_pull_request(repo_name: str, pr_number: int, title: str, body: str) -> str:
-    """Promotes the draft preflight PR to a ready PR with the real title and body.
+def _poll_for_oauth_token(device_code: str, interval: int, client_id: str) -> str:
+    while True:
+        time.sleep(interval)
+        resp = requests.post(
+            "https://github.com/login/oauth/access_token",
+            headers={"Accept": "application/json"},
+            json={
+                "client_id":   client_id,
+                "device_code": device_code,
+                "grant_type":  "urn:ietf:params:oauth:grant-type:device_code",
+            },
+        )
+        data = resp.json()
 
-    Returns the PR HTML URL.
-    """
-    g = _get_client()
-    pr = g.get_repo(repo_name).get_pull(pr_number)
-    pr.edit(title=title, body=body, draft=False)
-    log.info("PR #%d promoted to ready: %s", pr_number, pr.html_url)
-    return pr.html_url
+        match data.get("error"):
+            case "authorization_pending":
+                continue                      # user hasn't approved yet, keep waiting
+            case "slow_down":
+                interval += 5                 # GitHub asked us to back off
+                continue
+            case "expired_token":
+                raise RuntimeError("Code expired — restart the flow")
+            case "access_denied":
+                raise RuntimeError("User rejected the request")
+            case None:
+                return data["access_token"]   # done
