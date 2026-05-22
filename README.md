@@ -14,7 +14,7 @@ load_project_context ──(repo mismatch)────────────�
         │
         ▼
    read_issue → plan → code → test ──(pass)──────────────────────► create_pr
-                         ▲     │                                  (promotes draft PR)
+                         ▲     │
                          │     └──(fail)──► tester ──(APPROVED)──► create_pr
                          │                    │
                          └──(NEEDS_WORK, retry remaining)
@@ -24,18 +24,18 @@ load_project_context ──(repo mismatch)────────────�
                                           fail_state
 ```
 
-`preflight` runs before any LLM or context work. It verifies GitHub permissions and `ast-grep` availability, pushes an empty branch, and creates a draft PR — confirming end-to-end access before spending tokens. `create_pr` later promotes that draft to a ready PR.
+`preflight` clones the target repo to `local_repo_path` if it is missing or not a git repository. If the clone fails the graph routes immediately to `fail_state` before any LLM work begins.
 
 ### Workflow Stages
 
-1. **preflight** — Checks GitHub token scopes, pushes an empty `fix/issue-{N}` branch, creates a draft PR, and verifies `ast-grep` is on PATH. Any failure aborts immediately with a friendly message before any LLM work begins.
+1. **preflight** — Clones the target repository to `local_repo_path` if the directory is missing or not a git repo. Any failure aborts immediately before any LLM work begins.
 2. **load_project_context** — Validates the repo, loads skills, and generates a compressed project summary (cached in Redis → PostgreSQL). Fails immediately if `--repo` does not match the remote origin.
 3. **read_issue** — Fetches issue title + body from GitHub
 4. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; result cached (L1 local LRU + L2 Redis, 60 s TTL) so downstream failures don't force a redo
 5. **code** — ReAct loop: Claude explores the repo with `list_directory`/`read_file`, locates targets with ast-grep search tools, then edits files in-place via `str_replace_in_file`/`write_file`; outputs only unit tests in its final response; result cached per retry attempt — on a cache hit, file writes are re-applied to the working tree
 6. **test** — Runs solution + unit tests in an isolated Docker sandbox using the project's detected test runner
 7. **tester** — On failure: analyzes execution output and produces a structured verdict — `APPROVED` (solution is correct, early-terminate to PR) or `NEEDS_WORK` (feedback for the coder to iterate on)
-8. **create_pr** — Pushes real commits onto the preflight branch, then promotes the draft PR (updates title/body, clears draft flag)
+8. **create_pr** — Creates a new branch, commits the solution, pushes, and opens a pull request directly
 
 ## Quick Start
 
@@ -234,18 +234,11 @@ Trigger by labeling an issue with `generate-pr`
 
 ## How It Works
 
-### Preflight Checks
+### Preflight
 
-Before any LLM call or context work, the agent runs a preflight node that:
+Before any LLM call or context work, the agent runs a preflight node that clones the target repository to `local_repo_path` if the directory is missing or not a git repository (`ensure_repo_cloned`). If the clone fails, the graph routes immediately to `fail_state` and no tokens are spent.
 
-1. **GitHub scope check** — verifies the configured PAT has `repo`/`public_repo` scope, or the GitHub App has `pull_requests: write` and `contents: write`
-2. **Push probe** — pushes an empty commit to `fix/issue-{N}` to confirm write access to the target repo
-3. **Draft PR probe** — creates a draft PR on that branch to confirm PR creation access
-4. **ast-grep** — confirms `ast-grep` is on PATH
-
-If any step fails the graph routes immediately to `fail_state` and prints a human-readable error. No tokens are spent.
-
-On success, `create_pr` promotes the draft PR (updates title/body, clears draft flag) rather than opening a new one.
+If the repo is already present the node is a no-op and execution continues immediately.
 
 ### Repo Validation
 

@@ -85,14 +85,13 @@ The graph passes state through nodes in sequence:
 START
   │
   ├─► preflight
-  │   ├─ Check: GitHub token scopes (PAT: repo/public_repo | App: pull_requests+contents write)
-  │   ├─ Push: empty commit to fix/issue-{N} → confirms push access
-  │   ├─ Create: draft PR on that branch → confirms PR creation access
-  │   ├─ Check: ast-grep --version → confirms CLI on PATH
-  │   ├─ If any fail:
+  │   ├─ Call: ensure_repo_cloned(repo_name, local_repo_path)
+  │   │   ├─ If path missing or not a git repo: git clone <auth_url> local_repo_path
+  │   │   └─ If already present: no-op
+  │   ├─ If clone fails:
   │   │   └─ Return: {status: "preflight_failed", preflight_error: "<message>"}
   │   │   └─ [route_after_preflight → fail_state]  ← no tokens spent
-  │   └─ Return: {preflight_pr_number: <pr_number>}
+  │   └─ Return: {}
   │
   ├─► repo_validation
   │   ├─ Read: repo_name, local_repo_path
@@ -168,11 +167,11 @@ START
   ├─► create_pr (on success or tester APPROVED)
   │   ├─ Stash: agent's in-place edits
   │   ├─ Fetch + reset: sync base_branch from origin
-  │   ├─ Checkout: fix/issue-N (already exists from preflight)
+  │   ├─ Checkout: -b fix/issue-N (new branch from base_branch)
   │   ├─ Pop stash: restore agent edits onto feature branch
   │   ├─ Stage: all paths in modified_files
-  │   ├─ Commit + Push: real solution onto the preflight branch
-  │   ├─ Promote: update_pull_request(preflight_pr_number) → title/body + draft=False
+  │   ├─ Commit + Push: to origin
+  │   ├─ Open: open_pull_request(repo_name, branch_name, base_branch, title, body)
   │   └─ Return: {status: "pr_created", pr_url: ...}
   │
   ├─► handle_failure (on max iterations exceeded)
@@ -365,25 +364,24 @@ git commit + push
 
 **Why**: Keeps the branch creation deterministic (always starts from a fresh `base_branch`) while preserving in-place edits the ReAct agent made to arbitrary paths in the working tree.
 
-### 10. Preflight: Permission Probe Before Token Spend
+### 10. Preflight: Clone Before Token Spend
 
-**Design**: The first node pushes an empty branch and creates a draft PR to confirm end-to-end GitHub write access, then verifies `ast-grep` is on PATH. All four checks run before any LLM call.
+**Design**: The first node calls `ensure_repo_cloned(repo_name, local_repo_path)` before any LLM work.
 
 ```
-preflight_check
-  1. check_github_permissions()   ← token scopes / App permissions
-  2. push_empty_branch()          ← confirms push access to origin
-  3. create_draft_pr()            ← confirms PR creation access; stores pr_number
-  4. ast-grep --version           ← confirms code search CLI available
+preflight
+  1. ensure_repo_cloned(repo_name, local_repo_path)
+     ├─ path exists and contains .git → no-op
+     └─ missing or not a git repo    → git clone <auth_url> local_repo_path
 ```
 
-On any failure: `status = "preflight_failed"`, `preflight_error = "<message>"` → `fail_state` immediately.
+On failure: `status = "preflight_failed"`, `preflight_error = "<message>"` → `fail_state` immediately, no tokens spent.
 
-On success: `preflight_pr_number` is stored in state. `create_pr` calls `update_pull_request(pr_number)` to promote the draft (update title/body, set `draft=False`) rather than opening a new PR.
+On success: `create_pr` opens a fresh PR with `open_pull_request` — no draft promotion involved.
 
-**Why**: Expensive LLM work (context generation, planning, ReAct loop) should never start if the agent can't deliver its output. A permission failure discovered after a 2-minute coder loop is far more costly than a 3-second preflight probe.
+**Why**: Ensures the working tree exists before context loading, planning, or coding begins. A missing repo discovered mid-run after expensive LLM calls is far more disruptive than a sub-second existence check upfront.
 
-**`test_tool/`** — standalone CLI for manual pre-run validation and CI gating. Runs the same GitHub and ast-grep checks (plus Redis, PostgreSQL, MongoDB, Docker) in parallel outside the graph:
+**`test_tool/`** — standalone CLI for manual pre-run validation and CI gating (Redis, PostgreSQL, MongoDB, Docker, GitHub auth, ast-grep):
 
 ```bash
 python -m test_tool                        # all checks
@@ -440,7 +438,6 @@ class AgentState(TypedDict):
     implementation_plan: str  # structured plan from plan_solution
 
     # Preflight
-    preflight_pr_number: int  # draft PR number created by preflight; promoted by create_pr
     preflight_error: str      # human-readable failure reason (set when preflight fails)
 
     # Generated (ReAct coder edits files in-place)
@@ -463,14 +460,14 @@ class AgentState(TypedDict):
 
 ```
 preflight (fail)  → status = "preflight_failed" → route_after_preflight → fail_state (no tokens spent)
-preflight (ok)    → (no status set, preflight_pr_number stored)
+preflight (ok)    → (no status set)
 read_issue        → (no status set)
 test_code (pass)  → status = "success"           → route_after_test → create_pr
 test_code (fail)  → status = "retry"             → route_after_test → tester_review
 tester_review     → status = "tester_approved"   → route_after_tester → create_pr  (early exit)
                    (NEEDS_WORK, no status change) → route_after_tester → code or fail_state
 handle_failure    → status = "failed"
-create_pr         → status = "pr_created"        (promotes preflight draft PR)
+create_pr         → status = "pr_created"        (opens fresh PR via open_pull_request)
 ```
 
 ## Language Support Strategy
