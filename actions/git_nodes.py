@@ -1,10 +1,12 @@
 import logging
 
 from state import AgentState
-from tools.github import fetch_issue_from_github, open_pull_request
+from tools.github import GitHubClient
 from tools.git_ops import create_branch_and_commit, ensure_repo_cloned
 
 log = logging.getLogger(__name__)
+
+_github = GitHubClient()
 
 
 def preflight(state: AgentState) -> dict:
@@ -15,13 +17,14 @@ def preflight(state: AgentState) -> dict:
         return {"status": "preflight_failed", "preflight_error": str(exc)}
     return {}
 
+
 def read_github_issue(state: AgentState) -> dict:
     """Fetches issue details from GitHub API.
 
     Returns formatted issue title and body, initializes retry_count and max_retries.
     """
     log.info("Fetching GitHub issue #%d from %s...", state["issue_number"], state["repo_name"])
-    api_response = fetch_issue_from_github(state["repo_name"], state["issue_number"])
+    api_response = _github.fetch_issue(state["repo_name"], state["issue_number"])
     log.info("Issue fetched: %s", api_response["title"])
     return {
         "issue_details": f"Title: {api_response['title']}\nBody: {api_response['body']}",
@@ -42,7 +45,7 @@ def create_pr(state: AgentState) -> dict:
         modified_files=state.get("modified_files", []),
     )
 
-    pr_url = open_pull_request(
+    pr_url = _github.open_pull_request(
         repo_name=state["repo_name"],
         branch_name=branch_name,
         base_branch=state["base_branch"],

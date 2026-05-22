@@ -9,11 +9,13 @@ from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
 from pydantic import SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from tenacity import retry
 from tools.langchain_tools import get_code_search_tools
 
 from cache._llm import get_local_cache, make_cache_key
 from cache._llm import redis_get as _llm_redis_get
 from cache._llm import redis_set as _llm_redis_set
+from tools._retry import LLM_RETRY, RetryableError
 
 
 # Explicitly load .env into os.environ before Settings is instantiated.
@@ -105,14 +107,39 @@ def _messages_to_str(messages: list) -> str:
     )
 
 
-class _CachedLLM:
-    """Wraps a ChatAnthropic with L1 (LocalCache) + L2 (Redis, 60 s TTL) on invoke."""
+_LLM_RETRY_REASONS: dict[int, str] = {
+    429: "Rate limited: Anthropic throttles excessive requests; back off and retry.",
+    500: "Internal server error: Anthropic backend fault; likely transient.",
+    502: "Bad gateway: Anthropic proxy fault; transient.",
+    503: "Service unavailable: Anthropic maintenance or overload; retry after backoff.",
+    529: "Overloaded: Anthropic-specific API overloaded code; back off heavily.",
+}
+
+
+class LLMClient:
+    """Wraps ChatAnthropic with L1/L2 caching and retry on Anthropic transient errors.
+
+    Retried HTTP status codes from the Anthropic API:
+      429 — Rate limited: too many requests per minute; back off and retry.
+      500 — Internal server error: Anthropic backend fault; likely transient.
+      502 — Bad gateway: Anthropic proxy fault; transient.
+      503 — Service unavailable: Anthropic maintenance or overload; retry.
+      529 — Overloaded: Anthropic-specific "API overloaded" code; back off heavily.
+
+    Not retried:
+      400 — Bad request (malformed prompt or parameters; permanent).
+      401 — Auth failure (invalid API key; permanent).
+      404 — Model not found (wrong model ID; permanent).
+    """
+
+    _RETRYABLE_STATUSES = {429, 500, 502, 503, 529}
 
     def __init__(self, inner: ChatAnthropic, redis_url: str) -> None:
         self._inner = inner
         self._redis_url = redis_url
         self._local = get_local_cache()
 
+    @retry(**LLM_RETRY)
     def invoke(self, messages: list, **kwargs: Any):
         prompt_str = _messages_to_str(messages)
         key, compressed = make_cache_key(prompt_str)
@@ -128,7 +155,18 @@ class _CachedLLM:
             self._local.set(key, compressed, cached)
             return AIMessage(content=cached)
 
-        result = self._inner.invoke(messages, **kwargs)
+        try:
+            result = self._inner.invoke(messages, **kwargs)
+        except Exception as exc:
+            status_code = getattr(exc, "status_code", None)
+            if status_code in self._RETRYABLE_STATUSES:
+                raise RetryableError(
+                    status_code,
+                    str(exc),
+                    _LLM_RETRY_REASONS.get(status_code, "transient Anthropic API error"),
+                )
+            raise
+
         self._local.set(key, compressed, result.content)
         _llm_redis_set(self._redis_url, key, compressed, result.content)
         return result
@@ -137,7 +175,7 @@ class _CachedLLM:
         return getattr(self._inner, name)
 
 
-llm = _CachedLLM(
+llm = LLMClient(
     ChatAnthropic(
         model=settings.llm_model,
         api_key=settings.anthropic_api_key,
@@ -146,7 +184,7 @@ llm = _CachedLLM(
     redis_url=settings.redis_url,
 )
 
-_bounded_llm = _CachedLLM(
+_bounded_llm = LLMClient(
     ChatAnthropic(
         model=settings.llm_model,
         api_key=settings.anthropic_api_key,

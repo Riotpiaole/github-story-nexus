@@ -2,8 +2,8 @@ import json
 import logging
 import os
 import re
-import subprocess
 from pathlib import Path
+import subprocess
 
 from langchain_core.messages import HumanMessage
 
@@ -11,6 +11,7 @@ from cache import get_cache
 from state import AgentState
 from tools.ast_grep import search_functions
 from tools.github import fetch_issue_from_github
+from tools.npx_client import NPXClient
 
 from config import llm
 
@@ -21,7 +22,6 @@ _CACHE_KEY = "ctx:{user_id}:{safe_repo}"
 _SYMBOL_STRIP = re.compile(r'[#*`>_\-|\\]')
 _WHITESPACE_COLLAPSE = re.compile(r'\s+')
 
-_SKILLS_PATTERN = re.compile(r'^(\w+):\s*["\']?([^"\'#\n]+?)["\']?\s*$')
 _IGNORED_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv", ".mypy_cache"}
 _NOISE_TOKENS = re.compile(r'\b(__pycache__|\.pyc|\.DS_Store|Thumbs\.db)\b')
 
@@ -147,6 +147,9 @@ def repo_evaluation(state: AgentState) -> dict:
     return {}
 
 
+_npx = NPXClient()
+
+
 def load_skills(state: AgentState) -> dict:
     """Discovers and installs agent skills via find-skills CLI using the compressed project context."""
     context = state.get("project_context", "")
@@ -155,20 +158,7 @@ def load_skills(state: AgentState) -> dict:
         return {"skills": {}}
 
     query = _extract_skillset_query(context)
-
-    try:
-        search = subprocess.run(
-            ["npx", "--yes", "skills", "find", query],
-            capture_output=True, text=True, timeout=60,
-        )
-    except FileNotFoundError:
-        raise RuntimeError("npx not found — install Node.js to enable skill discovery.")
-
-    if search.returncode != 0:
-        log.warning("skills find failed: %s", search.stderr.strip())
-        return {"skills": {}}
-
-    skills = _parse_skills_output(search.stdout)
+    skills = _npx.find_skills(query)
 
     if not skills:
         log.warning("find-skills returned no matching skills for the project context.")
@@ -177,7 +167,7 @@ def load_skills(state: AgentState) -> dict:
     log.info("Skills discovered: %s", list(skills.keys()))
 
     for name, source in skills.items():
-        _install_skill(name, source)
+        _npx.add_skill(source, name)
 
     return {"skills": skills}
 
@@ -185,30 +175,6 @@ def load_skills(state: AgentState) -> dict:
 def _extract_skillset_query(context: str) -> str:
     cleaned = _SYMBOL_STRIP.sub(' ', context)
     return _WHITESPACE_COLLAPSE.sub(' ', cleaned).strip()
-
-
-def _parse_skills_output(output: str) -> dict:
-    """Parse `npx skills find` stdout into {skill_name: source_url}."""
-    skills: dict = {}
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        m = _SKILLS_PATTERN.match(line)
-        if m:
-            skills[m.group(1)] = m.group(2).strip()
-    return skills
-
-
-def _install_skill(name: str, source: str) -> None:
-    result = subprocess.run(
-        ["npx", "--yes", "skills", "add", source, "--skill", name],
-        capture_output=True, text=True, timeout=60,
-    )
-    if result.returncode == 0:
-        log.info("Installed skill '%s' from %s", name, source)
-    else:
-        log.warning("Failed to install skill '%s': %s", name, result.stderr.strip())
 
 
 def _read_text(path: Path) -> str:

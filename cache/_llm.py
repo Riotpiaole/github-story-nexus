@@ -29,7 +29,7 @@ from collections import OrderedDict
 from functools import lru_cache
 from pathlib import Path
 
-import redis as _redis
+from ._redis import RedisClient
 
 log = logging.getLogger(__name__)
 
@@ -192,33 +192,24 @@ def get_local_cache(cache_dir: Path | None = None) -> LocalCache:
 # ── L2: Redis cache (binary) ──────────────────────────────────────────────────
 
 @lru_cache(maxsize=8)
-def _redis_client(url: str) -> _redis.Redis:
-    return _redis.Redis.from_url(
-        url,
-        decode_responses=False,
-        socket_connect_timeout=2,
-        socket_timeout=2,
-        retry_on_timeout=False,
-    )
+def _binary_redis_client(url: str) -> RedisClient:
+    return RedisClient(url, decode_responses=False)
 
 
 def redis_get(url: str, key: str, compressed: bytes) -> str | None:
+    raw = _binary_redis_client(url).get(key)
+    if raw is None:
+        return None
     try:
-        raw = _redis_client(url).get(key)
-        if raw is None:
-            return None
         stored_prompt, response = unpack_entry(raw)
         if stored_prompt != compressed:
             log.warning("LLM cache L2 hash collision key=%s — overriding stale entry", key)
             return None
         return response
     except Exception as exc:
-        log.warning("LLM cache L2 GET failed key=%s: %s", key, exc)
+        log.warning("LLM cache L2 unpack error key=%s: %s", key, exc)
         return None
 
 
 def redis_set(url: str, key: str, compressed: bytes, response: str) -> None:
-    try:
-        _redis_client(url).set(key, pack_entry(compressed, response), ex=_TTL_SECONDS)
-    except Exception as exc:
-        log.warning("LLM cache L2 SET failed key=%s: %s", key, exc)
+    _binary_redis_client(url).set(key, pack_entry(compressed, response), ex=_TTL_SECONDS)
