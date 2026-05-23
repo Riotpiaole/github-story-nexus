@@ -1,121 +1,111 @@
 import logging
 import subprocess
-import tempfile
 from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-DOCKER_IMAGE = "story-pr-runner"
+# Test file written to the repo root before each run, cleaned up after.
+_TEST_FILES: dict[str, str] = {
+    "pytest":    "test_solution.py",
+    "unittest":  "test_solution.py",
+    "jest":      "test_solution.test.js",
+    "mocha":     "test_solution.test.js",
+    "go test":   "solution_test.go",
+    "cargo":     "tests/solution_test.rs",
+}
 
 _TEST_COMMANDS: dict[str, list[str]] = {
     "pytest":    ["pytest", "test_solution.py", "-v", "--tb=short"],
     "unittest":  ["python", "-m", "unittest", "test_solution", "-v"],
     "jest":      ["npx", "jest", "test_solution", "--no-coverage"],
-    "mocha":     ["npx", "mocha", "test_solution.js"],
+    "mocha":     ["npx", "mocha", "test_solution.test.js"],
     "go test":   ["go", "test", "./..."],
     "cargo":     ["cargo", "test"],
 }
 
+_TIMEOUT = 120
 
-class DockerClient:
-    """Wraps Docker CLI for sandboxed test execution.
 
-    Retry policy — run_tests is NOT retried by default:
-      Test failures (exit code != 0) are expected workflow outcomes, not errors.
-      TimeoutExpired is caught and returned as a failure result.
+class TestRunner:
+    """Runs tests directly in the local repository using the project's detected test runner.
 
-    The one retried scenario is exit code 125:
-      125 — Docker daemon error: container failed to start due to a transient daemon
-            fault, not a test failure. Retried once after a brief wait.
+    The coder writes solution files in-place to local_repo_path during code generation.
+    This runner writes only the generated test file to the repo root, executes the test
+    command in that directory, then removes the test file.
+
+    Timeout policy:
+      120 s hard timeout for all test runners. TimeoutExpired is caught and
+      returned as a failure result — not retried, as it indicates the solution
+      itself is causing a hang.
 
     Not retried:
       Any non-zero exit from the test runner — test failure, not infrastructure failure.
-      FileNotFoundError (Docker not installed) — raises immediately.
-
-    Build the runner image once with:
-        docker build -t story-pr-runner -f Dockerfile.runner .
+      FileNotFoundError (test runner binary not on PATH) — raises immediately with
+      a clear message so the caller can surface it as a configuration error.
     """
 
-    _DAEMON_ERROR_CODE = 125
-    _MAX_DAEMON_RETRIES = 1
-
     def run_tests(
-        self, solution_code: str, test_code: str, test_runner: str = "pytest"
+        self, test_code: str, test_runner: str, local_repo_path: str
     ) -> dict:
-        """Writes solution + test files to a temp dir and runs the test command
-        inside a Docker container with no network access and capped resources.
+        """Writes the test file to the repo and runs the test command in-place.
 
         Args:
-            solution_code: Solution code to be tested.
-            test_code: Unit test code targeting the solution.
+            test_code: Unit test source code produced by the coder.
             test_runner: Test runner key from project skills (e.g. 'pytest', 'jest').
-                         Defaults to 'pytest' when not detected from skills.
+            local_repo_path: Absolute path to the local repository clone.
 
         Returns:
             Dict with 'success' bool and 'output' str containing test results.
         """
         cmd = _TEST_COMMANDS.get(test_runner, _TEST_COMMANDS["pytest"])
+        test_file_name = _TEST_FILES.get(test_runner, "test_solution.py")
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            tmppath = Path(tmpdir)
-            (tmppath / "solution.py").write_text(solution_code)
-            (tmppath / "test_solution.py").write_text(test_code)
+        repo = Path(local_repo_path)
+        test_file = repo / test_file_name
+        test_file.parent.mkdir(parents=True, exist_ok=True)
+        test_file.write_text(test_code)
 
-            return self._run_docker(tmpdir, cmd, test_runner, retries_left=self._MAX_DAEMON_RETRIES)
-
-    def _run_docker(
-        self, tmpdir: str, cmd: list[str], test_runner: str, retries_left: int
-    ) -> dict:
         log.info(
-            "Running tests inside Docker container (image=%s, runner=%s)...",
-            DOCKER_IMAGE, test_runner,
+            "Running tests directly in repo (runner=%s, file=%s)...",
+            test_runner, test_file_name,
         )
         try:
             result = subprocess.run(
-                [
-                    "docker", "run", "--rm",
-                    "--network", "none",
-                    "--memory", "128m",
-                    "--cpus", "0.5",
-                    "-v", f"{tmpdir}:/code",
-                    DOCKER_IMAGE,
-                    *cmd,
-                ],
+                cmd,
+                cwd=local_repo_path,
                 capture_output=True,
                 text=True,
-                timeout=60,
+                timeout=_TIMEOUT,
             )
 
             if result.returncode == 0:
                 log.info("Tests passed.")
                 return {"success": True, "output": result.stdout.strip()}
 
-            if result.returncode == self._DAEMON_ERROR_CODE and retries_left > 0:
-                # 125 — Docker daemon error (transient); retry once
-                log.warning(
-                    "Docker daemon error (exit 125) — retrying (%d left)...", retries_left
-                )
-                return self._run_docker(tmpdir, cmd, test_runner, retries_left - 1)
-
             output = result.stderr.strip() or result.stdout.strip()
             log.warning("Tests failed:\n%s", output)
             return {"success": False, "output": output}
 
         except subprocess.TimeoutExpired:
-            log.error("Test execution timed out after 60 seconds.")
-            return {"success": False, "output": "Execution timed out after 60 seconds."}
+            log.error("Test execution timed out after %d seconds.", _TIMEOUT)
+            return {"success": False, "output": f"Execution timed out after {_TIMEOUT} seconds."}
 
         except FileNotFoundError:
             raise RuntimeError(
-                "Docker is not installed or not on PATH. "
-                "Install Docker and build the runner image:\n"
-                "  docker build -t story-pr-runner -f Dockerfile.runner ."
+                f"Test runner '{cmd[0]}' is not installed or not on PATH. "
+                f"Install it and ensure it is accessible in the environment."
             )
+
+        finally:
+            try:
+                test_file.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # Module-level singleton and backward-compat wrapper
-_docker_client = DockerClient()
+_test_runner = TestRunner()
 
 
-def execute_tests(solution_code: str, test_code: str, test_runner: str = "pytest") -> dict:
-    return _docker_client.run_tests(solution_code, test_code, test_runner)
+def execute_tests(test_code: str, test_runner: str, local_repo_path: str) -> dict:
+    return _test_runner.run_tests(test_code, test_runner, local_repo_path)

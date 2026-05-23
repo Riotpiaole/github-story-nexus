@@ -4,6 +4,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage
@@ -99,6 +100,9 @@ log = logging.getLogger(__name__)
 
 _AGENT_MAX_TOKENS = 5000
 
+# connect: fail fast if Anthropic is unreachable; read: enough for long generations.
+_LLM_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=5.0)
+
 
 def _messages_to_str(messages: list) -> str:
     return "\n---\n".join(
@@ -157,6 +161,12 @@ class LLMClient:
 
         try:
             result = self._inner.invoke(messages, **kwargs)
+        except httpx.TimeoutException as exc:
+            raise RetryableError(
+                "timeout",
+                str(exc),
+                "Read timeout waiting for Anthropic response; retrying.",
+            )
         except Exception as exc:
             status_code = getattr(exc, "status_code", None)
             if status_code in self._RETRYABLE_STATUSES:
@@ -180,6 +190,7 @@ llm = LLMClient(
         model=settings.llm_model,
         api_key=settings.anthropic_api_key,
         max_tokens=4096,
+        timeout=_LLM_TIMEOUT,
     ),
     redis_url=settings.redis_url,
 )
