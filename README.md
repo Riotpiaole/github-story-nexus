@@ -7,21 +7,27 @@ A **generic issue-to-PR generator** that automatically reads GitHub issues, gene
 This tool transforms GitHub issues into complete pull requests through an intelligent, project-aware workflow:
 
 ```
-preflight ──(fail)──────────────────────────────────────────────────► fail_state
+preflight ──(fail)──────────────────────────────────────────────────────────► fail_state
         │
         ▼
-load_project_context ──(repo mismatch)──────────────────────────────► fail_state
+load_project_context ──(repo mismatch)──────────────────────────────────────► fail_state
         │
         ▼
-   read_issue → plan → code → test ──(pass)──────────────────────► create_pr
-                         ▲     │
-                         │     └──(fail)──► tester ──(APPROVED)──► create_pr
-                         │                    │
-                         └──(NEEDS_WORK, retry remaining)
-                                              │
-                                       (max iterations)
-                                              ▼
-                                          fail_state
+   read_issue → plan → execute_step ──(more steps)──► execute_step (loop)
+                              │
+                         (all done)
+                              ▼
+                           reflect → test ──(pass)──────────────────────────► create_pr
+                                       │
+                                       └──(fail)──► tester ──(APPROVED)─────► create_pr
+                                                       │
+                                              (NEEDS_WORK, retry remaining)
+                                                       │
+                                                    → plan (re-plan with feedback)
+                                                       │
+                                              (max retries exhausted)
+                                                       ▼
+                                                   fail_state
 ```
 
 `preflight` clones the target repo to `local_repo_path` if it is missing or not a git repository. If the clone fails the graph routes immediately to `fail_state` before any LLM work begins.
@@ -30,19 +36,24 @@ load_project_context ──(repo mismatch)────────────�
 
 1. **preflight** — Clones the target repository to `local_repo_path` if the directory is missing or not a git repo. Any failure aborts immediately before any LLM work begins.
 2. **load_project_context** — Validates the repo, loads skills, and generates a compressed project summary (cached in Redis → PostgreSQL). Fails immediately if `--repo` does not match the remote origin.
-3. **read_issue** — Fetches issue title + body from GitHub
-4. **plan** — Single LLM call producing a structured implementation plan from the issue and cached project context; result cached (L1 local LRU + L2 Redis, 60 s TTL) so downstream failures don't force a redo
-5. **code** — ReAct loop: Claude explores the repo with `list_directory`/`read_file`, locates targets with ast-grep search tools, then edits files in-place via `str_replace_in_file`/`write_file`; outputs only unit tests in its final response; result cached per retry attempt — on a cache hit, file writes are re-applied to the working tree
-6. **test** — Runs solution + unit tests in an isolated Docker sandbox using the project's detected test runner
-7. **tester** — On failure: analyzes execution output and produces a structured verdict — `APPROVED` (solution is correct, early-terminate to PR) or `NEEDS_WORK` (feedback for the coder to iterate on)
-8. **create_pr** — Creates a new branch, commits the solution, pushes, and opens a pull request directly
+3. **read_issue** — Fetches issue title + body from GitHub.
+4. **plan** — Single LLM call producing a structured implementation plan; parses the "Ordered steps" section into a `list[str]` of discrete tasks. Resets `step_idx`, `step_results`, and `modified_files` for a clean execution cycle. Result cached (L1 local LRU + L2 Redis, 60 s TTL) keyed by `user_id:repo:issue:retry_count`.
+5. **execute_step** — Runs one ReAct loop per plan step. Loops back to itself via `route_after_execute` until all steps are done, then advances to `reflect`. Accumulates `modified_files` (deduplicated) and `step_results` across iterations; the last step's test code is forwarded to the test node.
+6. **reflect** — Logs a summary of what was accomplished across all steps. Informational only — no state mutation.
+7. **test** — Writes the generated test file to the repo, runs it in-place using the project's detected test runner (`pytest`, `jest`, `go test`, etc.), then removes the file. Returns `success` or `retry`.
+8. **tester** — On failure: analyzes execution output and emits a verdict:
+   - `APPROVED` — solution satisfies the issue requirements (tests were wrong but code is correct); routes directly to PR creation.
+   - `NEEDS_WORK` — structured feedback (root cause, code issues, test issues, suggestions) fed back into the next `plan` call.
+9. **create_pr** — Creates a new branch, commits the solution, pushes, and opens a pull request directly.
 
 ## Quick Start
 
 ### Usage
 
 ```bash
-python main.py --repo owner/repo --issue 42 --path /path/to/repo [--base main]
+python main.py run --repo owner/repo --issue 42 --path /path/to/repo [--base main]
+# Or start the HTTP server (default):
+python main.py
 ```
 
 ### Key Feature: Dynamic Skills Discovery
@@ -58,11 +69,11 @@ This enables:
 ## Requirements
 
 - Python 3.12+
-- Docker (for sandboxed testing)
 - GitHub credentials (PAT or App)
 - Redis (for context caching)
 - PostgreSQL with pgvector (optional, for semantic search)
 - `ast-grep` CLI (for code analysis)
+- Node.js / `npx` (for skills discovery)
 
 ## Installation
 
@@ -76,22 +87,16 @@ cd story-pr-agent
 ### 2. Install Python dependencies
 
 ```bash
-uv add -r requirements.txt
+uv sync
 ```
 
-### 3. Build the Docker test runner image
-
-```bash
-docker build -t story-pr-runner -f Dockerfile.runner .
-```
-
-### 4. Install ast-grep
+### 3. Install ast-grep
 
 ```bash
 npm install -g @ast-grep/cli
 ```
 
-### 5. Start Redis
+### 4. Start Redis
 
 ```bash
 redis-server
@@ -99,7 +104,7 @@ redis-server
 docker run -d -p 6379:6379 redis:latest
 ```
 
-### 6. Configure environment variables
+### 5. Configure environment variables
 
 ```bash
 cp .env.example .env
@@ -174,7 +179,7 @@ The agent understands:
 ### CLI
 
 ```bash
-python main.py \
+python main.py run \
   --repo owner/repo \
   --issue 42 \
   --path /path/to/local/clone \
@@ -187,11 +192,12 @@ python main.py \
 | `--issue` | yes | Issue number |
 | `--path` | yes | Path to local clone of repo |
 | `--base` | no | Base branch (default: `main`) |
+| `--user` | no | User ID for cache key (default: `cli`) |
 
 ### Via Flask REST API
 
 ```bash
-flask --app app run --host 0.0.0.0 --port 8000
+python main.py serve --port 8000
 ```
 
 Start a run:
@@ -236,7 +242,7 @@ Trigger by labeling an issue with `generate-pr`
 
 ### Preflight
 
-Before any LLM call or context work, the agent runs a preflight node that clones the target repository to `local_repo_path` if the directory is missing or not a git repository (`ensure_repo_cloned`). If the clone fails, the graph routes immediately to `fail_state` and no tokens are spent.
+Before any LLM call or context work, the agent runs a preflight node that clones the target repository to `local_repo_path` if the directory is missing or not a git repository. If the clone fails, the graph routes immediately to `fail_state` and no tokens are spent.
 
 If the repo is already present the node is a no-op and execution continues immediately.
 
@@ -246,7 +252,6 @@ Before processing, the agent validates:
 - ✓ Local path exists and is a git repository
 - ✓ Remote origin is configured and accessible
 - ✓ `--repo` matches the remote origin URL
-- ✓ No uncommitted changes that would conflict with PR
 
 If `--repo` does not match the remote origin, the workflow sets `status: repo_mismatch` and routes directly to `fail_state` — no skills loading, no context generation, no LLM calls. The CLI exits with code 1 and logs the conflicting repo and path.
 
@@ -254,13 +259,9 @@ If `--repo` does not match the remote origin, the workflow sets `status: repo_mi
 
 After generating the compressed project context, the agent runs `npx skills find` with the full context text as the search query. Matching skills are then installed automatically via `npx skills add`.
 
-This replaces the earlier static `skills.sh` approach — skills are now **discovered dynamically** from the project's actual content rather than declared manually.
-
 Requirements:
 - Node.js must be installed (`npx` available on `$PATH`)
 - Internet access to reach the skills.sh registry
-
-This enables **generic code generation** — the same agent can generate Python, JavaScript, Go, etc.
 
 ### Context Loading
 
@@ -274,40 +275,62 @@ The agent analyzes the project structure:
 This context is:
 - **Cached in Redis** for fast retrieval on repeated runs
 - **Compressed** to control LLM token usage
-- **Injected into prompts** to guide code generation
+- **Injected into all prompts** to guide code generation
 
-### Planning
+### Plan-Execute-Reflect Loop
 
-Before writing any code, the agent runs a single LLM call against the cached `project_context` and the GitHub issue to produce a structured implementation plan (approach selection, affected components, ordered steps, risk assessment). The planner never re-explores the codebase — the cached context is sufficient.
+The core of the agent is a three-phase loop replacing the old single-shot code node:
 
-The plan result is cached (L1 in-memory LRU + L2 Redis, 60 s TTL) keyed by `user_id:repo_name:issue_number`. On a cache hit, the LLM call is skipped entirely, which prevents re-planning after a transient downstream failure.
+#### 1. Plan
 
-### Code Generation with Skills
+A single LLM call produces a structured implementation plan for the issue. The planner outputs a markdown document with an **Ordered steps** section; the agent parses this into a `list[str]` of discrete tasks (e.g. "Add model field", "Update serializer", "Write migration").
 
-The coder runs a **ReAct (Reason + Act)** loop — up to 10 tool iterations, 5000 output token cap — where it explores and edits the repository directly rather than generating a standalone snippet:
+The plan is cached per retry attempt so a downstream failure doesn't force re-planning. On tester retry the plan node re-runs with the tester's structured feedback, producing a revised step list for the next execution cycle.
+
+#### 2. Execute (per-step ReAct loop)
+
+`execute_step` runs one ReAct loop for each plan step, cycling back to itself until all steps are done:
 
 | Step | Tools used |
 |------|-----------|
 | Explore structure | `list_directory`, `read_file` |
 | Locate targets | `find_functions`, `search_code_patterns` |
 | Apply changes | `str_replace_in_file` (targeted edit), `write_file` (new file) |
-| Finish | Emits only `### TESTS <unit test code>` |
+| Finish last step | Emits `### TESTS <unit test code>` |
 
-Every `write_file` / `str_replace_in_file` call is tracked as a `modified_files` entry. After the loop, those files are read back and concatenated as `code_snippet` for the sandboxed executor.
+Each iteration accumulates `modified_files` (deduplicated across steps) and a `step_results` summary. The loop cap is 10 ReAct iterations per step and 5000 output tokens per LLM call.
 
-The code result is cached per retry attempt (L1 in-memory LRU + L2 Redis, 60 s TTL) keyed by `user_id:repo_name:issue_number:retry_count`. On a cache hit the file writes are re-applied to the working tree before returning, keeping the repo consistent even after a process crash.
+#### 3. Reflect
 
-On retry, the coder receives the tester's structured feedback. Because prior edits are already in the repo, it uses `str_replace_in_file` to fix specific problems rather than rewriting from scratch.
+After all steps complete, the reflect node logs the full plan and per-step summaries. It makes no state changes — it exists purely for observability before handing off to the test node.
+
+### In-Repo Test Execution
+
+Tests run directly in the local repository clone — no Docker sandbox required:
+
+1. The generated test file is written to the repo root under a runner-specific filename (`test_solution.py`, `test_solution.test.js`, etc.)
+2. The test runner command is executed with `cwd=local_repo_path`
+3. The test file is removed in a `finally` block regardless of outcome
+
+Supported runners and their commands:
+
+| Runner | Command |
+|--------|---------|
+| `pytest` | `pytest test_solution.py -v` |
+| `jest` | `npx jest test_solution.test.js --no-coverage` |
+| `go test` | `go test ./...` |
+| `cargo test` | `cargo test` |
+| `unittest` | `python -m unittest test_solution` |
 
 ### Iterative Coder-Tester Loop
 
-After each code generation:
-1. Solution + unit tests are executed in an isolated Docker sandbox using the project's detected test runner (`skills.test_runner`)
-2. On failure, the **tester** analyzes the execution output and emits a verdict:
-   - `VERDICT: APPROVED` — solution satisfies the issue requirements (e.g. tests were wrong but code is correct); skips further iteration and goes straight to PR creation
-   - `VERDICT: NEEDS_WORK` — provides root cause, solution issues, test issues, and concrete suggestions for the coder
-3. The coder retries with the tester's feedback until tests pass, an APPROVED verdict is received, or `MAX_RETRIES` is exhausted
-4. The tester is also capped at **5000 output tokens** per call
+After each full execute cycle:
+1. The generated tests run in the local repo using the project's detected test runner.
+2. On failure, the **tester** analyzes execution output and emits a verdict:
+   - `APPROVED` — solution satisfies the issue requirements; routes directly to PR creation.
+   - `NEEDS_WORK` — root cause, code issues, test issues, and concrete suggestions are fed back into the next `plan` call.
+3. On retry, `plan` re-runs with the tester's feedback and resets `step_idx`, `step_results`, and `modified_files` for a fresh execution cycle.
+4. The loop repeats until tests pass, an `APPROVED` verdict is received, or `MAX_RETRIES` is exhausted.
 
 ## Environment Variables
 
@@ -323,7 +346,7 @@ After each code generation:
 | `GITHUB_SECRET` | — | GitHub OAuth App client secret (web UI login) |
 | `GOOGLE_OAUTH_CLIENT_ID` | — | Google OAuth client ID (optional, web UI) |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | — | Google OAuth client secret (optional, web UI) |
-| `MAX_RETRIES` | `3` | Max full coder→tester iterations before giving up |
+| `MAX_RETRIES` | `3` | Max full plan→execute→test cycles before giving up |
 | `LLM_MODEL` | `claude-sonnet-4-6` | Claude model to use for all LLM calls |
 | `BASE_BRANCH` | `main` | Default PR target branch |
 | `REDIS_URL` | `redis://localhost:6379` | Redis — L1 context cache (60 s TTL) |
@@ -336,47 +359,40 @@ After each code generation:
 
 ```
 .
-├── main.py                         # CLI entry point
+├── main.py                         # CLI entry point (run / serve subcommands)
 ├── app.py                          # Flask REST API server
 ├── webhook.py                      # FastAPI webhook server (GitHub events)
 ├── graph.py                        # LangGraph state machine
-├── state.py                        # State schema & routing
-├── config.py                       # Settings & initialization
-├── Dockerfile.runner               # Test execution Docker image
-├── requirements.txt                # Python dependencies
+├── state.py                        # State schema & routing functions
+├── config.py                       # Settings, LLMClient, LLM factory helpers
 ├── .env.example                    # Environment variable template
 ├── actions/
-│   ├── git_nodes.py               # Git operations (read issue, create PR)
-│   ├── llm_nodes.py               # LLM nodes: planner, coder, tester, test runner
-│   ├── context_nodes.py           # Repo validation, skills loading, context gen
-│   ├── planner_prompt.md          # Structured planning prompt (PLAN MODE)
-│   ├── coder_prompt.md            # ReAct coder prompt (explore → edit → output tests)
-│   └── tester_prompt.md           # Generic failure analysis prompt (APPROVED / NEEDS_WORK)
+│   ├── git_nodes.py               # Git operations: read issue, create PR
+│   ├── llm_nodes.py               # plan_solution, execute_step, reflect, test_code, tester_review
+│   ├── context_nodes.py           # Preflight, repo validation, skills loading, context gen
+│   ├── planner_prompt.md          # Structured planning prompt (outputs Ordered steps section)
+│   ├── coder_prompt.md            # Per-step ReAct coder prompt (explore → edit → output tests)
+│   └── tester_prompt.md           # Failure analysis prompt (APPROVED / NEEDS_WORK)
 ├── cache/
-│   ├── __init__.py                # Public API: get_cache()
-│   ├── _manager.py                # Two-level cache orchestration (L1 → L2)
-│   ├── _redis.py                  # L1: Redis with 60 s TTL
-│   └── _pg.py                     # L2: PostgreSQL persistent fallback
+│   ├── __init__.py                # Public API: get_local_cache(), make_cache_key()
+│   ├── _llm.py                    # LLM response cache (L1 local + L2 Redis)
+│   ├── _redis.py                  # RedisClient with retry on connection errors
+│   └── _pg.py                     # PostgreSQL persistent context cache (L2 fallback)
 ├── tools/
-│   ├── executor.py                # Docker test execution
-│   ├── github.py                  # GitHub API integration
-│   ├── git_ops.py                 # Git CLI operations
+│   ├── _retry.py                  # Shared RetryableError + tenacity config constants
+│   ├── executor.py                # TestRunner: writes test file, runs in-repo, cleans up
+│   ├── github.py                  # GitHubClient + GitHubOAuthClient (retryable)
+│   ├── git_ops.py                 # Git CLI operations (branch, commit, push)
+│   ├── npx_client.py              # NPXClient: skills find/add via npx subprocess
 │   ├── ast_grep.py                # ast-grep CLI wrapper
 │   ├── langchain_tools.py         # LLM-callable tools: search + file read/write/edit
-│   ├── storage.py                 # Redis + PostgreSQL abstraction
 │   ├── context_generator.py       # Project context generation
-│   └── context_compression.py     # Context compression strategies
-├── test_tool/
-│   ├── __main__.py                # CLI entry point (python -m test_tool)
-│   ├── runner.py                  # Parallel check runner + result formatter
-│   └── checks/
-│       ├── github.py              # GitHub auth + PR scope check
-│       ├── redis.py               # Redis PING
-│       ├── postgres.py            # PostgreSQL SELECT 1
-│       ├── mongodb.py             # MongoDB ping
-│       ├── docker.py              # Docker daemon + image presence
-│       ├── ast_grep.py            # ast-grep --version
-│       └── node.py                # node/npx --version
+│   └── context_compression.py    # Context compression strategies
+├── auth/
+│   └── db.py                      # MongoDBClient (retryable) + module-level helpers
+├── cli_runner/
+│   ├── runner.py                  # Parallel check runner + colored result formatter
+│   └── checks/                   # Individual service health check modules
 └── README.md                       # This file
 ```
 
@@ -405,13 +421,13 @@ framework: django
 test_runner: pytest
 
 # Issue: "Add user authentication endpoint"
-python main.py --repo myorg/myproject --issue 123 --path /path/to/myproject
+python main.py run --repo myorg/myproject --issue 123 --path /path/to/myproject
 
-# Result: Claude generates:
-# - Django models for authentication
-# - API endpoints with proper decorators
-# - pytest tests matching project structure
-# - PR with all changes
+# Agent:
+# 1. Plans: ["Add model field", "Update serializer", "Add view", "Write pytest tests"]
+# 2. Executes each step via ReAct loop (reads files, edits in-place)
+# 3. Runs pytest directly in the repo
+# 4. Opens PR with all changes
 ```
 
 ### Example 2: Node.js Express API
@@ -423,13 +439,13 @@ framework: express
 test_runner: jest
 
 # Issue: "Add rate limiting middleware"
-python main.py --repo myorg/api --issue 456 --path /path/to/api
+python main.py run --repo myorg/api --issue 456 --path /path/to/api
 
-# Result: Claude generates:
-# - Express middleware function
-# - Jest tests with mocks
-# - Integration into existing routes
-# - PR ready to merge
+# Agent:
+# 1. Plans: ["Install express-rate-limit", "Write middleware", "Wire into app", "Write jest tests"]
+# 2. Executes each step, accumulating modified files across steps
+# 3. Runs jest directly in the repo
+# 4. Opens PR ready to merge
 ```
 
 ## Pre-run Connectivity Check
@@ -437,13 +453,13 @@ python main.py --repo myorg/api --issue 456 --path /path/to/api
 Before running the agent, verify all external service connections:
 
 ```bash
-python -m test_tool                        # check all services
-python -m test_tool --only github,ast_grep # check specific services
-python -m test_tool --list                 # list available checks
-python -m test_tool --verbose              # show full tracebacks on failure
+python -m cli_runner                          # check all services
+python -m cli_runner --only github,ast_grep   # check specific services
+python -m cli_runner --list                   # list available checks
+python -m cli_runner --verbose                # show full tracebacks on failure
 ```
 
-Note: the preflight node inside the graph runs the GitHub and ast-grep checks automatically on every run. `test_tool` is for manual validation and CI gating before invoking the agent.
+Note: the preflight node inside the graph runs the GitHub and ast-grep checks automatically on every run. `cli_runner` is for manual validation and CI gating before invoking the agent.
 
 ## Troubleshooting
 
@@ -451,12 +467,12 @@ Note: the preflight node inside the graph runs the GitHub and ast-grep checks au
 - Ensure Redis is running: `redis-cli ping`
 - Check `REDIS_URL` in `.env`
 
-### Docker Test Runner Not Found
-- Build image: `docker build -t story-pr-runner -f Dockerfile.runner .`
-
 ### Repo Validation Fails
 - **`--repo` mismatch**: The `--repo owner/repo` value must match the remote origin of the local clone at `--path`. Check with `git -C /path/to/repo remote get-url origin`.
-- **Uncommitted changes**: Stash or commit all local changes before running (`git stash`).
+
+### Test Execution Fails
+- Ensure the detected test runner is installed in the target repo's environment (e.g. `pytest`, `jest`).
+- The test file is always cleaned up — check the repo for a leftover `test_solution.*` file if a crash occurred.
 
 ### No Skills Discovered
 - Ensure `npx` is available: `npx --version`
@@ -467,15 +483,17 @@ Note: the preflight node inside the graph runs the GitHub and ast-grep checks au
 - Check `ANTHROPIC_API_KEY` is valid
 - Verify Claude model in `.env` is available
 - Check token limits (Claude Sonnet has 200K context)
+- LLM calls time out after 120 s read / 10 s connect and retry up to 4 times on 429/5xx
 
 ## Contributing
 
 Contributions welcome! When adding support for new languages/frameworks:
 
-1. Add language support to `context_generator.py`
-2. Update `skills.sh` example in this README
-3. Add to "Capabilities by Language" table
-4. Test with example repository
+1. Add the test runner command to `_TEST_COMMANDS` in `tools/executor.py`
+2. Add language support to `context_generator.py`
+3. Update `skills.sh` example in this README
+4. Add to "Capabilities by Language" table
+5. Test with example repository
 
 ## License
 

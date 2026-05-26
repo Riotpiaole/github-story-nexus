@@ -10,6 +10,10 @@ services:
     environment:
       REDIS_URL: redis://redis:6379
       POSTGRES_VEC_URL: postgresql://postgres:postgres@postgres:5432/vectordb
+      POSTGRES_CHECKPOINT_URL: postgresql://postgres:postgres@postgres:5432/vectordb
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_BASE_URL: ${LANGFUSE_BASE_URL:-https://cloud.langfuse.com}
       MONGODB_URI: mongodb://${MONGO_USERNAME}:${MONGO_PASSWORD}@mongo:27017
     depends_on:
       redis:

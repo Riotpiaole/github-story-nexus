@@ -13,7 +13,7 @@ from state import (
 )
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     """Builds and compiles the LangGraph state machine with a plan-execute-reflect loop.
 
     Workflow:
@@ -82,4 +82,4 @@ def build_graph():
     workflow.add_edge("create_pr", END)
     workflow.add_edge("fail_state", END)
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=checkpointer)

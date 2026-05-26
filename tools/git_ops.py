@@ -82,7 +82,6 @@ def create_branch_and_commit(
         base_branch: Base branch to branch from (e.g. 'main').
         modified_files: Repo-relative paths written by the ReAct agent.
     """
-    auth_url = _get_auth_url(local_repo_path)
 
     # Stash only when there is actually something to save
     did_stash = False
@@ -93,9 +92,9 @@ def create_branch_and_commit(
 
     # Sync base_branch to latest remote
     log.info("Fetching latest '%s' from origin...", base_branch)
-    _run(["git", "fetch", auth_url, base_branch], cwd=local_repo_path)
+    _run(["git", "fetch", "origin", "main"], cwd=local_repo_path)
     if _current_branch(local_repo_path) != base_branch:
-        _run(["git", "checkout", base_branch], cwd=local_repo_path)
+        _run(["git", "rebase", "origin", "main"], cwd=local_repo_path)
     _run(["git", "reset", "--hard", "FETCH_HEAD"], cwd=local_repo_path)
 
     # Switch to feature branch (create only if it doesn't exist yet)
@@ -107,7 +106,7 @@ def create_branch_and_commit(
         _run(["git", "stash", "pop"], cwd=local_repo_path)
 
     for f in modified_files:
-        _run(["git", "add", f], cwd=local_repo_path)
+        _run(["git", "add", "."], cwd=local_repo_path)
 
     status = _run(["git", "status", "--porcelain"], cwd=local_repo_path)
     if not status:
@@ -120,5 +119,5 @@ def create_branch_and_commit(
         )
 
     log.info("Pushing branch '%s'...", branch_name)
-    _run(["git", "push", "-u", auth_url, branch_name], cwd=local_repo_path)
+    _run(["git", "push" , "--set-upstream",  "origin", branch_name], cwd=local_repo_path)
     log.info("Branch '%s' pushed to origin.", branch_name)

@@ -22,7 +22,8 @@ from flask import Flask, jsonify, request
 from flask_login import current_user, login_required
 
 from auth import init_auth
-from config import configure_logging, get_settings
+from cache._checkpointer import get_checkpointer
+from config import configure_logging, get_langfuse_handler, get_settings
 from graph import build_graph
 
 configure_logging()
@@ -30,7 +31,8 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 init_auth(app)
-_graph = build_graph()
+_checkpointer = get_checkpointer(get_settings().postgres_checkpoint_url)
+_graph = build_graph(checkpointer=_checkpointer)
 
 # Bound concurrency to the number of logical CPUs so we never spawn more
 # simultaneous graph runs than the machine can actually execute in parallel.
@@ -53,8 +55,21 @@ def _execute(run_id: str, initial_state: dict) -> None:
         run_id: UUID string used to look up this run via GET /run/<run_id>.
         initial_state: Fully populated AgentState dict passed to graph.invoke().
     """
+    thread_id = f"{initial_state['user_id']}:{initial_state['repo_name']}:{initial_state['issue_number']}"
+    config = {"configurable": {"thread_id": thread_id}}
+    handler = get_langfuse_handler(thread_id)
+    if handler:
+        config["callbacks"] = [handler]
+
+    existing = _checkpointer.get_tuple(config)
+    if existing:
+        last_node = existing.metadata.get("source", "unknown")
+        log.info("Run %s: checkpoint found (last node: %s) — resuming.", run_id, last_node)
+    else:
+        log.info("Run %s: no checkpoint found — starting fresh.", run_id)
+
     try:
-        final = _graph.invoke(initial_state)
+        final = _graph.invoke(initial_state, config=config)
         agent_status = final.get("status", "unknown")
         with _runs_lock:
             _runs[run_id] = {
@@ -113,6 +128,10 @@ def start_run():
         "skills": {},
         "project_context": "",
         "issue_details": "",
+        "plan": [],
+        "step_idx": 0,
+        "step_results": [],
+        "modified_files": [],
         "code_snippet": "",
         "test_code": "",
         "test_results": "",

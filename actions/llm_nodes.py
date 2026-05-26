@@ -193,8 +193,21 @@ def execute_step(state: AgentState) -> dict:
     Accumulates modified_files and step_results across iterations.
     The last step's test_code is forwarded to the test node.
     Loops back via route_after_execute until all steps are done.
+    Result is cached per step and retry so a crash-and-resume skips the ReAct loop.
     """
     step_idx = state["step_idx"]
+    key_str = (
+        f"node:execute:{state['user_id']}:{state['repo_name']}"
+        f":{state['issue_number']}:{state['retry_count']}:{step_idx}"
+    )
+    cached = _node_cache_get(key_str)
+    if cached is not None:
+        log.info(
+            "execute_step: cache hit step %d (attempt %d) — skipping ReAct loop.",
+            step_idx + 1, state["retry_count"] + 1,
+        )
+        return cached
+
     plan = state["plan"]
     step = plan[step_idx]
     plan_str = "\n".join(f"{i + 1}. {s}" for i, s in enumerate(plan))
@@ -243,6 +256,7 @@ def execute_step(state: AgentState) -> dict:
     }
     if test_code:
         updates["test_code"] = test_code
+    _node_cache_set(key_str, updates)
     return updates
 
 

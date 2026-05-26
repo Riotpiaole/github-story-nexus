@@ -35,6 +35,10 @@ def read_github_issue(state: AgentState) -> dict:
 
 def create_pr(state: AgentState) -> dict:
     """Commits the solution and opens a pull request."""
+    if state.get("pr_url"):
+        log.info("PR already created at %s — skipping.", state["pr_url"])
+        return {"status": "pr_created"}
+
     branch_name = f"fix/issue-{state['issue_number']}"
     log.info("Committing code and opening PR on branch '%s'...", branch_name)
 

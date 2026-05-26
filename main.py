@@ -2,7 +2,7 @@ import argparse
 import logging
 import sys
 
-from config import configure_logging, settings
+from config import configure_logging, get_langfuse_handler, settings
 
 configure_logging()
 log = logging.getLogger(__name__)
@@ -15,8 +15,10 @@ def _serve(args: argparse.Namespace) -> None:
 
 
 def _run(args: argparse.Namespace) -> None:
+    from cache._checkpointer import get_checkpointer
     from graph import build_graph
-    graph = build_graph()
+    checkpointer = get_checkpointer(settings.postgres_checkpoint_url)
+    graph = build_graph(checkpointer=checkpointer)
     initial_state = {
         "user_id": args.user,
         "repo_name": args.repo,
@@ -39,8 +41,20 @@ def _run(args: argparse.Namespace) -> None:
         "pr_url": "",
     }
 
-    log.info("Starting agent for %s issue #%d...", args.repo, args.issue)
-    final = graph.invoke(initial_state)
+    thread_id = f"{args.user}:{args.repo}:{args.issue}"
+    config = {"configurable": {"thread_id": thread_id}}
+    handler = get_langfuse_handler(thread_id)
+    if handler:
+        config["callbacks"] = [handler]
+
+    existing = checkpointer.get_tuple(config)
+    if existing:
+        last_node = existing.metadata.get("source", "unknown")
+        log.info("Checkpoint found (last node: %s) — resuming run for %s issue #%d.", last_node, args.repo, args.issue)
+    else:
+        log.info("No checkpoint found — starting fresh run for %s issue #%d.", args.repo, args.issue)
+
+    final = graph.invoke(initial_state, config=config)
 
     if final["status"] == "pr_created":
         log.info("Done. PR: %s", final["pr_url"])

@@ -50,9 +50,15 @@ class Settings(BaseSettings):
     langchain_api_key: str = ""
     langchain_project: str = "story-pr-agent"
 
+    # ── Langfuse tracing (optional) ────────────────────────────────────────────
+    langfuse_public_key: str = ""
+    langfuse_secret_key: str = ""
+    langfuse_base_url: str = "https://cloud.langfuse.com"
+
     # ── Cache infrastructure ────────────────────────────────────────────────────
     redis_url: str = "redis://localhost:6379"
     postgres_vec_url: str = "postgresql://postgres:postgres@localhost:5432/vectordb"
+    postgres_checkpoint_url: str = "postgresql://postgres:postgres@localhost:5432/vectordb"
 
     # ── MongoDB ────────────────────────────────────────────────────────────────
     mongo_username: str
@@ -81,6 +87,27 @@ def _configure_langsmith(s: Settings) -> None:
         os.environ["LANGCHAIN_TRACING_V2"] = "true"
         os.environ["LANGCHAIN_API_KEY"] = s.langchain_api_key
         os.environ["LANGCHAIN_PROJECT"] = s.langchain_project
+
+
+def get_langfuse_handler(thread_id: str | None = None):
+    """Returns a Langfuse CallbackHandler for the given run, or None if not configured.
+
+    Langfuse v4 reads LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY / LANGFUSE_BASE_URL
+    from the environment automatically. thread_id is hashed to a valid 32-char hex
+    trace_id (uuid5) so each run appears as a named trace in Langfuse and can be
+    cross-referenced with Postgres checkpoint rows.
+    """
+    if not settings.langfuse_public_key:
+        return None
+    import uuid
+    from langfuse.langchain import CallbackHandler
+    trace_context = None
+    if thread_id:
+        # Langfuse requires a 32 lowercase hex char trace_id; uuid5 gives a
+        # deterministic UUID from the human-readable thread_id string.
+        trace_id = uuid.uuid5(uuid.NAMESPACE_DNS, thread_id).hex
+        trace_context = {"trace_id": trace_id}
+    return CallbackHandler(trace_context=trace_context)
 
 
 def configure_logging() -> None:
@@ -190,7 +217,6 @@ llm = LLMClient(
         model=settings.llm_model,
         api_key=settings.anthropic_api_key,
         max_tokens=4096,
-        timeout=_LLM_TIMEOUT,
     ),
     redis_url=settings.redis_url,
 )
